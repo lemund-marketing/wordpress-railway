@@ -1,0 +1,23 @@
+#!/bin/bash
+# Roda em segundo plano a cada boot (iniciado pelo wpr-mariadb-entrypoint, como root):
+# espera o servidor DEFINITIVO (o temporário do 1º boot/upgrade sobe sem rede, então o teste é pela porta TCP)
+# e aplica o SQL idempotente do wpr-bancos-sql pelo socket local. Nunca imprime senha.
+set -uo pipefail
+log() { echo "[bancos] $*"; }
+porta="${WPR_MARIADB_PORTA:-3306}"
+pronto=0
+for _ in $(seq 1 900); do   # até ~15 min (1º boot, upgrade ou volume grande)
+  # "ping" devolve 0 mesmo com acesso negado: só quer saber se o servidor atende na porta
+  if mariadb-admin --protocol=tcp -h 127.0.0.1 -P "$porta" --connect-timeout=2 ping >/dev/null 2>&1; then pronto=1; break; fi
+  sleep 1
+done
+[ "$pronto" = 1 ] || { log "AVISO: servidor não respondeu na porta $porta; bancos não conferidos neste boot"; exit 0; }
+for tentativa in 1 2 3; do
+  if err="$(wpr-bancos-sql 2>/dev/null | MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-}" mariadb --protocol=socket -uroot 2>&1 >/dev/null)"; then
+    log "conferidos a cada boot: ${BANCOS} (o que faltava foi criado; senhas alinhadas às variáveis)"
+    exit 0
+  fi
+  log "AVISO: tentativa $tentativa de conferir os bancos falhou: ${err}"
+  sleep 5
+done
+exit 0

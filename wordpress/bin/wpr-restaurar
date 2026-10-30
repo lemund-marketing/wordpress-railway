@@ -1,0 +1,281 @@
+#!/bin/bash
+# Autorrestauração do site a partir de um pacote baixado por HTTP(S): arquivos (.tar.gz) + banco (.sql.gz).
+# Chamado pelo wpr-entrypoint ANTES do Apache. Sem RESTAURAR_ARQUIVOS_URL e sem RESTAURAR_BANCO_URL: não faz nada.
+#
+# Variáveis:
+#   RESTAURAR_ARQUIVOS_URL      .tar.gz com entradas relativas a /var/www: html/... = docroot; outras pastas = irmãs
+#                               do docroot (ficam em /var/www/<pasta>). Symlinks preservados.
+#   RESTAURAR_BANCO_URL         .sql.gz do mariadb-dump do banco do site (tem de terminar com "-- Dump completed")
+#   RESTAURAR_AUTH              "usuario:senha" do HTTP Basic Auth (opcional)
+#   RESTAURAR_ARQUIVOS_SHA256   opcional: se diferente do baixado, aborta sem tocar no site
+#   RESTAURAR_BANCO_SHA256      idem para o banco
+#   RESTAURAR_VERSAO            texto livre (padrão "1"): marca o que já foi restaurado
+#   RESTAURAR_SOBRESCREVER      "sim": substitui conteúdo existente quando a VERSAO muda (sincronização final)
+#   RESTAURAR_ESPERA_BANCO      segundos de espera pelo banco (padrão 300)
+#
+# Regras (arquivos e banco decididos separadamente):
+#   - volume sem conteúdo / banco sem tabelas            => restaura;
+#   - mesma VERSAO já restaurada                          => não faz nada (reiniciar não restaura de novo);
+#   - conteúdo existente + VERSAO nova sem SOBRESCREVER   => não toca e avisa no log;
+#   - conteúdo existente + VERSAO nova + SOBRESCREVER=sim => substitui.
+#   Tudo é baixado e conferido (sha256, gzip, fim do dump, extração, wp-config) ANTES de mexer no site. Os arquivos
+#   entram por troca de pasta (o site nunca fica pela metade). Qualquer falha => sai com erro e não marca.
+#   Marcadores: /var/www/.wpr-restauracao/{arquivos,banco} (1ª linha = VERSAO). Temporários: /var/www/.wpr-tmp-*.
+# Nunca imprime senha nem a URL completa (só esquema, host e nome do arquivo).
+set -euo pipefail
+export LC_ALL=C
+BASE=/var/www
+DOCROOT="$BASE/html"
+CTRL="$BASE/.wpr-restauracao"
+URL_ARQ="${RESTAURAR_ARQUIVOS_URL:-}"
+URL_BANCO="${RESTAURAR_BANCO_URL:-}"
+[ -n "$URL_ARQ$URL_BANCO" ] || exit 0
+
+VERSAO="$(printf '%s' "${RESTAURAR_VERSAO:-1}" | tr -d '\r\n')"
+[ -n "$VERSAO" ] || VERSAO=1
+SOBRESCREVER=nao
+case "${RESTAURAR_SOBRESCREVER:-}" in sim|SIM|Sim) SOBRESCREVER=sim ;; esac
+ESPERA="${RESTAURAR_ESPERA_BANCO:-300}"
+case "$ESPERA" in ''|*[!0-9]*) ESPERA=300 ;; esac
+
+TMP=""; MON=""
+log()  { echo "[restaurar] $*"; }
+erro() { echo "[restaurar] ERRO: $*"; exit 1; }
+limpar() {
+  if [ -n "$MON" ]; then kill "$MON" 2>/dev/null || true; fi
+  if [ -n "$TMP" ] && [ -d "$TMP" ]; then rm -rf "$TMP"; fi
+}
+trap limpar EXIT
+
+# URL para o log: esquema://host/…/arquivo (sem usuário/senha, sem caminho do meio, sem query)
+url_log() {
+  local u="$1" esq resto host arq
+  esq="${u%%://*}"; resto="${u#*://}"; resto="${resto%%[?#]*}"; resto="${resto##*@}"
+  host="${resto%%/*}"; arq=""
+  case "$resto" in */*) arq="${resto##*/}" ;; esac
+  printf '%s://%s/…/%s' "$esq" "$host" "$arq"
+}
+tamanho() { numfmt --to=iec --suffix=B "$(stat -c %s "$1" 2>/dev/null || echo 0)"; }
+esc_cfg() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+# configuração do curl pelo stdin: URL e usuário:senha não aparecem na linha de comando (ps) nem no log
+curl_cfg() {
+  printf 'url = "%s"\n' "$(esc_cfg "$1")"
+  if [ -n "${RESTAURAR_AUTH:-}" ]; then printf 'user = "%s"\n' "$(esc_cfg "$RESTAURAR_AUTH")"; fi
+}
+
+validar_url() { # url rótulo
+  case "$1" in
+    https://*) ;;
+    http://*) if [ -n "${RESTAURAR_AUTH:-}" ]; then log "AVISO: $2 por http:// (sem TLS) com RESTAURAR_AUTH: a senha trafega aberta"; fi ;;
+    *) erro "$2: a URL precisa começar com https:// (recebido: $(url_log "$1"))" ;;
+  esac
+}
+
+baixar() { # url destino rótulo
+  local url="$1" dest="$2" rot="$3" t0 tent
+  log "$rot: baixando $(url_log "$url")"
+  t0=$(date +%s)
+  for tent in 1 2 3; do
+    rm -f "$dest"
+    ( while sleep 30; do [ -f "$dest" ] && echo "[restaurar] $rot: ... $(tamanho "$dest") baixados"; done ) &
+    MON=$!
+    if curl_cfg "$url" | curl --config - --fail --location --silent --show-error --retry 4 --retry-delay 10 \
+         --retry-all-errors --connect-timeout 30 --speed-limit 1024 --speed-time 120 --output "$dest"; then
+      kill "$MON" 2>/dev/null || true; wait "$MON" 2>/dev/null || true; MON=""
+      log "$rot: baixado ($(tamanho "$dest")) em $(( $(date +%s) - t0 )) s"
+      return 0
+    fi
+    kill "$MON" 2>/dev/null || true; wait "$MON" 2>/dev/null || true; MON=""
+    log "$rot: tentativa $tent de 3 falhou"
+    [ "$tent" = 3 ] || sleep $(( tent * 15 ))
+  done
+  erro "$rot: não consegui baixar (URL, RESTAURAR_AUTH e alcance do servidor conferem?); nada foi alterado"
+}
+
+conferir_sha() { # arquivo esperado rótulo
+  local esperado obtido
+  esperado="$(printf '%s' "$2" | awk '{print tolower($1)}')"
+  if [ -z "$esperado" ]; then log "$3: sha256 não informado (conferência pulada)"; return 0; fi
+  obtido="$(sha256sum "$1" | cut -d' ' -f1)"
+  if [ "$obtido" != "$esperado" ]; then
+    erro "$3: sha256 diferente do informado (esperado ${esperado:0:12}…, baixado ${obtido:0:12}…); nada foi alterado"
+  fi
+  log "$3: sha256 confere (${obtido:0:12}…)"
+}
+
+marca() { head -n 1 "$CTRL/$1" 2>/dev/null || true; }
+gravar_marca() { # nome sha
+  mkdir -p "$CTRL"; chmod 0700 "$CTRL"
+  printf '%s\nrestaurado em %s\nsha256 %s\n' "$VERSAO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$CTRL/$1.tmp"
+  mv -f "$CTRL/$1.tmp" "$CTRL/$1"
+}
+
+# conteúdo = docroot com qualquer item, ou pasta/arquivo irmão visível (lost+found e ocultos não contam)
+tem_conteudo() {
+  [ -n "$(find "$DOCROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && return 0
+  [ -n "$(find "$BASE" -mindepth 1 -maxdepth 1 ! -name html ! -name lost+found ! -name '.*' -print -quit 2>/dev/null)" ]
+}
+
+# ---- banco: conexão pelas variáveis WORDPRESS_DB_* (senha só em MYSQL_PWD)
+db_host=""; db_port=""
+db_preparar() {
+  local v
+  for v in WORDPRESS_DB_HOST WORDPRESS_DB_NAME WORDPRESS_DB_USER WORDPRESS_DB_PASSWORD; do
+    [ -n "${!v:-}" ] || erro "banco: falta a variável $v (o banco do site vem das variáveis WORDPRESS_DB_*); nada foi alterado"
+  done
+  db_host="${WORDPRESS_DB_HOST%:*}"; db_port="${WORDPRESS_DB_HOST##*:}"
+  [ "$db_port" = "$WORDPRESS_DB_HOST" ] && db_port=3306
+  return 0
+}
+db_sql() { MYSQL_PWD="$WORDPRESS_DB_PASSWORD" mariadb -h "$db_host" -P "$db_port" -u "$WORDPRESS_DB_USER" --connect-timeout=5 -N -B -e "$1" "$WORDPRESS_DB_NAME"; }
+db_esperar() { # segundos -> 0 conectou / 1 não
+  local fim=$(( $(date +%s) + $1 )) e=""
+  while :; do
+    if e="$(db_sql 'SELECT 1' 2>&1 >/dev/null)"; then return 0; fi
+    [ "$(date +%s)" -lt "$fim" ] || { log "banco: última resposta: ${e:-sem resposta}"; return 1; }
+    sleep 5
+  done
+}
+n_tabelas() { db_sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()"; }
+
+# =====================================================================================================
+log "versão pedida: '$VERSAO'; sobrescrever: $SOBRESCREVER"
+[ -z "$URL_ARQ" ] || validar_url "$URL_ARQ" "arquivos"
+[ -z "$URL_BANCO" ] || validar_url "$URL_BANCO" "banco"
+
+# sobras de uma restauração interrompida (são só nossas)
+for velho in "$BASE"/.wpr-tmp-*; do
+  if [ -e "$velho" ]; then log "apagando temporário de restauração anterior interrompida: ${velho#"$BASE"/}"; rm -rf "$velho"; fi
+done
+
+# ---- decisão: arquivos
+fazer_arq=nao
+if [ -n "$URL_ARQ" ]; then
+  m="$(marca arquivos)"
+  if ! tem_conteudo; then
+    fazer_arq=sim; log "arquivos: volume sem conteúdo => restaurar"
+  elif [ "$m" = "$VERSAO" ]; then
+    log "arquivos: versão '$VERSAO' já restaurada; nada a fazer"
+  elif [ "$SOBRESCREVER" = sim ]; then
+    fazer_arq=sim; log "arquivos: versão nova '$VERSAO' (atual: '${m:-nenhuma}') com RESTAURAR_SOBRESCREVER=sim => substituir"
+  else
+    log "AVISO: arquivos: o volume já tem conteúdo (versão restaurada: '${m:-nenhuma}') e RESTAURAR_VERSAO='$VERSAO' é nova: NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
+  fi
+fi
+
+# ---- decisão: banco
+fazer_banco=nao
+if [ -n "$URL_BANCO" ]; then
+  db_preparar
+  m="$(marca banco)"
+  if [ -f "$CTRL/banco.em-andamento" ]; then
+    log "banco: há importação anterior interrompida; esperando o banco em $db_host:$db_port (até ${ESPERA} s)"
+    db_esperar "$ESPERA" || erro "banco: não respondeu em ${ESPERA} s; nada foi alterado"
+    fazer_banco=sim; log "banco: refazer a importação interrompida"
+  elif [ "$m" = "$VERSAO" ]; then
+    # já restaurado: não segura o boot se o banco estiver fora (o site mostra o erro de conexão e volta sozinho)
+    if db_esperar 30; then
+      if [ "$(n_tabelas)" = 0 ]; then fazer_banco=sim; log "banco: versão '$VERSAO' marcada, mas o banco está sem tabelas => restaurar"
+      else log "banco: versão '$VERSAO' já restaurada; nada a fazer"; fi
+    else
+      log "AVISO: banco: sem resposta em 30 s; versão '$VERSAO' já restaurada, seguindo sem conferir"
+    fi
+  else
+    log "banco: esperando $db_host:$db_port (até ${ESPERA} s)"
+    db_esperar "$ESPERA" || erro "banco: não respondeu em ${ESPERA} s (WORDPRESS_DB_* corretas? serviço do banco no ar?); nada foi alterado"
+    nt="$(n_tabelas)" || erro "banco: não consegui contar as tabelas; nada foi alterado"
+    if [ "$nt" = 0 ]; then
+      fazer_banco=sim; log "banco: sem tabelas => restaurar"
+    elif [ "$SOBRESCREVER" = sim ]; then
+      fazer_banco=sim; log "banco: $nt tabelas, versão nova '$VERSAO' (atual: '${m:-nenhuma}') com RESTAURAR_SOBRESCREVER=sim => substituir"
+    else
+      log "AVISO: banco: já tem $nt tabelas (versão restaurada: '${m:-nenhuma}') e RESTAURAR_VERSAO='$VERSAO' é nova: NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
+    fi
+  fi
+fi
+
+if [ "$fazer_arq" = nao ] && [ "$fazer_banco" = nao ]; then exit 0; fi
+
+TMP="$BASE/.wpr-tmp-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -m 0700 "$TMP"
+log "espaço livre no volume: $(df -h --output=avail "$BASE" | tail -n 1 | tr -d ' ')"
+
+# ---- 1. baixar e conferir tudo (nada no site muda nesta fase)
+sha_arq="-"; sha_banco="-"
+if [ "$fazer_arq" = sim ]; then
+  baixar "$URL_ARQ" "$TMP/arquivos.tar.gz" "arquivos"
+  conferir_sha "$TMP/arquivos.tar.gz" "${RESTAURAR_ARQUIVOS_SHA256:-}" "arquivos"
+  sha_arq="$(sha256sum "$TMP/arquivos.tar.gz" | cut -d' ' -f1)"
+fi
+if [ "$fazer_banco" = sim ]; then
+  baixar "$URL_BANCO" "$TMP/banco.sql.gz" "banco"
+  conferir_sha "$TMP/banco.sql.gz" "${RESTAURAR_BANCO_SHA256:-}" "banco"
+  sha_banco="$(sha256sum "$TMP/banco.sql.gz" | cut -d' ' -f1)"
+  gzip -t "$TMP/banco.sql.gz" 2>/dev/null || erro "banco: o .sql.gz está corrompido (gzip -t); nada foi alterado"
+  fim="$(gzip -dc "$TMP/banco.sql.gz" | tail -n 1)"
+  case "$fim" in "-- Dump completed"*) ;; *) erro "banco: o dump não termina com '-- Dump completed' (incompleto?); nada foi alterado" ;; esac
+  log "banco: dump íntegro ($(gzip -dc "$TMP/banco.sql.gz" | grep -c '^CREATE TABLE' || true) tabelas no dump)"
+fi
+
+# ---- 2. extrair e preparar os arquivos numa pasta temporária do volume
+NOVO="$TMP/novo"
+if [ "$fazer_arq" = sim ]; then
+  mkdir "$NOVO"
+  log "arquivos: extraindo"
+  t0=$(date +%s)
+  tar -xzf "$TMP/arquivos.tar.gz" -C "$NOVO" --no-same-owner --warning=no-unknown-keyword \
+    || erro "arquivos: falha ao extrair o .tar.gz (corrompido ou sem espaço no volume); nada foi alterado"
+  rm -f "$TMP/arquivos.tar.gz"
+  [ -d "$NOVO/html" ] && [ ! -L "$NOVO/html" ] \
+    || erro "arquivos: o pacote não tem a pasta html/ na raiz (as entradas devem ser relativas a /var/www: html/...); nada foi alterado"
+  for x in "$NOVO"/lost+found "$NOVO"/.wpr-*; do
+    if [ -e "$x" ] || [ -L "$x" ]; then log "arquivos: ignorando ${x#"$NOVO"/} do pacote"; rm -rf "$x"; fi
+  done
+  log "arquivos: extraídos em $(( $(date +%s) - t0 )) s: $(find "$NOVO" -type f | wc -l) arquivos, $(find "$NOVO" -type d | wc -l) pastas, $(find "$NOVO" -type l | wc -l) links; raiz: $(find "$NOVO" -mindepth 1 -maxdepth 1 -printf '%f ' | sort)"
+  chown -R -h www-data:www-data "$NOVO"
+  log "arquivos: pós-cópia (wp-config pelas variáveis, symlinks, .htaccess, mu-plugins)"
+  WPR_DOCROOT="$NOVO/html" WPR_DOCROOT_FINAL="$DOCROOT" wpr-pos-copia \
+    || erro "arquivos: o pós-cópia falhou (ver acima); nada foi alterado"
+fi
+
+# ---- 3. banco: importar (o dump já foi conferido); marcador "em andamento" cobre uma queda no meio
+if [ "$fazer_banco" = sim ]; then
+  mkdir -p "$CTRL"; chmod 0700 "$CTRL"
+  printf '%s\n' "$VERSAO" > "$CTRL/banco.em-andamento"
+  log "banco: importando em $WORDPRESS_DB_NAME (as tabelas existentes são apagadas antes)"
+  wpr-banco importar "$TMP/banco.sql.gz" \
+    || erro "banco: a importação falhou; o próximo boot refaz a importação (o pacote é baixado de novo)"
+  nt="$(n_tabelas)" || erro "banco: não consegui contar as tabelas depois da importação"
+  [ "$nt" -gt 0 ] || erro "banco: a importação terminou sem nenhuma tabela"
+  rm -f "$TMP/banco.sql.gz"
+  gravar_marca banco "$sha_banco"
+  rm -f "$CTRL/banco.em-andamento"
+  log "banco: restaurado ($nt tabelas); versão '$VERSAO' marcada"
+fi
+
+# ---- 4. arquivos: troca de pasta (html e irmãs que vieram no pacote); o Apache ainda não subiu
+if [ "$fazer_arq" = sim ]; then
+  ANTIGO="$TMP/antigo"; mkdir "$ANTIGO"
+  trocados=()
+  desfazer() {
+    local n
+    for n in "${trocados[@]}"; do
+      rm -rf "${BASE:?}/$n" 2>/dev/null || true
+      if [ -e "$ANTIGO/$n" ] || [ -L "$ANTIGO/$n" ]; then mv "$ANTIGO/$n" "$BASE/$n" || true; fi
+    done
+  }
+  mapfile -d '' itens < <(find "$NOVO" -mindepth 1 -maxdepth 1 -printf '%f\0')
+  for n in "${itens[@]}"; do
+    if [ -e "$BASE/$n" ] || [ -L "$BASE/$n" ]; then
+      mv "$BASE/$n" "$ANTIGO/$n" || { desfazer; erro "arquivos: falha ao afastar /var/www/$n; troca desfeita"; }
+    fi
+    trocados+=("$n")
+    mv "$NOVO/$n" "$BASE/$n" || { desfazer; erro "arquivos: falha ao colocar /var/www/$n; troca desfeita"; }
+  done
+  gravar_marca arquivos "$sha_arq"
+  log "arquivos: restaurados (${trocados[*]}); versão '$VERSAO' marcada"
+fi
+
+log "apagando temporários"
+limpar; TMP=""
+log "concluído"

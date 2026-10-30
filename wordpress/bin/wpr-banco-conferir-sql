@@ -1,0 +1,15 @@
+#!/bin/bash
+# Imprime, para o banco atual, 1 linha por tabela: nome  linhas  checksum  engine  collation  (TAB, ordenado).
+# Usa só 2 conexões (hospedagens compartilhadas recusam conexões em rajada). Credenciais: variáveis do cliente
+# mariadb (MYSQL_PWD) e argumentos -h/-u/<banco> repassados. Uso: wpr-banco-conferir-sql -h HOST -u USER BANCO
+set -euo pipefail
+export LC_ALL=C
+lista="$(mariadb "$@" -N -B -e "SELECT table_name, engine, IFNULL(table_collation,'') FROM information_schema.tables WHERE table_schema=DATABASE() AND table_type='BASE TABLE' ORDER BY table_name" </dev/null)"
+[ -n "$lista" ] || { echo "nenhuma tabela" >&2; exit 0; }
+sql="$(printf '%s\n' "$lista" | awk -F'\t' '{printf "SELECT \x27C\x27, \x27%s\x27, COUNT(*) FROM `%s`;\nCHECKSUM TABLE `%s`;\n", $1, $1, $1}')"
+res="$(printf '%s\n' "$sql" | mariadb "$@" -N -B)"
+{ printf '%s\n' "$lista" | sed 's/^/T\t/'; printf '%s\n' "$res"; } | awk -F'\t' '
+  $1=="T" {eng[$2]=$3; col[$2]=$4; next}
+  $1=="C" {cnt[$2]=$3; next}
+  { n=$1; sub(/^[^.]*\./,"",n); ck[n]=$2 }
+  END { for (t in eng) printf "%s\t%s\t%s\t%s\t%s\n", t, cnt[t], ck[t], eng[t], col[t] }' | sort

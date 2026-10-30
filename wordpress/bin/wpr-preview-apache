@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pré-visualização no Apache (complementa o mu-plugin railway-preview.php): no host *.up.railway.app, troca o
+# domínio oficial (SITE_DOMAIN) pelo host provisório também em CSS/JS/HTML estáticos e marca noindex.
+set -euo pipefail
+conf="${WPR_PREVIEW_CONF:-/etc/apache2/conf-enabled/zz-railway-preview.conf}"
+rm -f "$conf"
+[ "${RAILWAY_PREVIEW:-1}" = "0" ] && exit 0
+host="${PREVIEW_HOST:-${RAILWAY_PUBLIC_DOMAIN:-}}"
+case "$host" in *.up.railway.app) ;; *) exit 0 ;; esac
+[ -n "${SITE_DOMAIN:-}" ] || { echo "[preview] SITE_DOMAIN vazio; filtro do Apache não ligado"; exit 0; }
+base="${SITE_DOMAIN#www.}"
+{
+  echo "# gerado pelo wpr-preview-apache — host provisório $host"
+  echo "<IfModule mod_substitute.c>"
+  echo "FilterDeclare RAILWAYPREVIEW"
+  echo "FilterProvider RAILWAYPREVIEW SUBSTITUTE \"%{HTTP_HOST} == '$host' && %{CONTENT_TYPE} =~ m#^(text/(html|css|javascript|xml|plain)|application/(javascript|x-javascript|json|ld\\+json|xml|rss\\+xml))#i\""
+  echo "FilterChain RAILWAYPREVIEW"
+  echo "FilterProtocol RAILWAYPREVIEW change=yes"
+  echo "SubstituteMaxLineLength 32m"
+  for h in "www.$base" "$base"; do
+    for s in https http; do
+      echo "Substitute \"s|$s://$h|https://$host|inq\""
+      echo "Substitute \"s|$s:\\/\\/$h|https:\\/\\/$host|inq\""
+    done
+    echo "Substitute \"s|//$h|//$host|inq\""
+  done
+  echo "</IfModule>"
+  echo "<If \"%{HTTP_HOST} == '$host'\">"
+  echo "    Header always set X-Robots-Tag \"noindex, nofollow\""
+  echo "</If>"
+} > "$conf"
+echo "[preview] filtro do Apache ligado para $host (domínio oficial $base)"

@@ -1,0 +1,27 @@
+#!/bin/bash
+# Escreve no stdout o SQL IDEMPOTENTE que garante, para cada nome N de BANCOS ("site1 site2"):
+#   banco N (utf8mb4) + usuário N@'%' com a senha da variável DB_<N EM MAIÚSCULAS>_PASSWORD + ALL no banco N.
+# A senha do usuário é sempre alinhada à variável (ALTER USER), então trocar a variável e reiniciar troca a senha.
+# Nome inválido/reservado ou senha vazia: aviso no stderr e esse banco é pulado (os outros seguem).
+# O SQL (com a senha) só sai pelo stdout, direto para o cliente mariadb; nada de senha no log.
+set -euo pipefail
+reservados=" root mysql sys information_schema performance_schema mariadb.sys "
+for n in ${BANCOS:-}; do
+  if ! [[ "$n" =~ ^[A-Za-z0-9_]{1,32}$ ]]; then
+    echo "[bancos] AVISO: nome inválido '$n' (só letras, números e _, até 32): pulado" >&2; continue
+  fi
+  case "$reservados" in *" ${n,,} "*) echo "[bancos] AVISO: nome reservado '$n': pulado" >&2; continue ;; esac
+  var="DB_${n^^}_PASSWORD"
+  pw="${!var:-}"
+  if [ -z "$pw" ]; then
+    echo "[bancos] AVISO: variável $var vazia: banco/usuário $n pulado" >&2; continue
+  fi
+  pw_sql="${pw//\\/\\\\}"; pw_sql="${pw_sql//\'/\\\'}"
+  cat <<SQL
+CREATE DATABASE IF NOT EXISTS \`${n}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${n}'@'%' IDENTIFIED BY '${pw_sql}';
+ALTER USER '${n}'@'%' IDENTIFIED BY '${pw_sql}';
+GRANT ALL PRIVILEGES ON \`${n}\`.* TO '${n}'@'%';
+SQL
+  echo "[bancos] banco/usuario ${n}: incluído" >&2
+done

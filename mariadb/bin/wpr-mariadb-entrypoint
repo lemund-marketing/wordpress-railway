@@ -1,0 +1,12 @@
+#!/bin/bash
+# Entrypoint do MariaDB: o oficial (docker-entrypoint.sh) + "garantir bancos" a cada boot, em segundo plano.
+# Assim um banco acrescentado em BANCOS depois do 1º boot (ou uma senha trocada na variável) passa a valer
+# só reiniciando o serviço.
+set -euo pipefail
+case "${1:-}" in
+  mariadbd|mysqld|-*)
+    if [ -n "${BANCOS:-}" ] && [ "$(id -u)" = "0" ]; then
+      wpr-bancos-garantir &
+    fi ;;
+esac
+exec docker-entrypoint.sh "$@"

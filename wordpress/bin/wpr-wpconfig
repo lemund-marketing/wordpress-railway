@@ -1,0 +1,106 @@
+#!/usr/local/bin/php
+<?php
+/**
+ * Ajusta o wp-config.php copiado do servidor antigo para rodar no contêiner. Idempotente.
+ *  - DB_NAME/DB_USER/DB_PASSWORD/DB_HOST passam a vir das variáveis WORDPRESS_DB_* (a senha some do arquivo);
+ *  - bloco "railway": HTTPS atrás do proxy (X-Forwarded-Proto) e DISABLE_WP_CRON opcional (WP_DISABLE_CRON=1).
+ * Chaves/salts, WP_CACHE_KEY_SALT, COOKIEHASH e o resto ficam IDÊNTICOS (plugins de cache e outros dependem
+ * deles). Nunca imprime valores.
+ * Uso: wpr-wpconfig [--check] [/var/www/html/wp-config.php]
+ *      wpr-wpconfig --stdin [/var/www/html/wp-config.php]   (original vem pela entrada padrão e NUNCA é gravado
+ *                                                           como está: só a versão ajustada chega ao disco)
+ */
+$file  = '/var/www/html/wp-config.php';
+$check = false;
+$stdin = false;
+foreach ( array_slice( $argv, 1 ) as $a ) {
+	if ( '--check' === $a ) {
+		$check = true;
+	} elseif ( '--stdin' === $a ) {
+		$stdin = true;
+	} else {
+		$file = $a;
+	}
+}
+$src = $stdin ? stream_get_contents( STDIN ) : @file_get_contents( $file );
+if ( false === $src || '' === $src ) {
+	fwrite( STDERR, "wpr-wpconfig: não achei " . ( $stdin ? 'conteúdo na entrada' : $file ) . "\n" );
+	exit( 1 );
+}
+$orig    = $stdin && is_file( $file ) ? (string) file_get_contents( $file ) : ( $stdin ? '' : $src );
+$changes = array();
+$map     = array(
+	'DB_NAME'     => 'WORDPRESS_DB_NAME',
+	'DB_USER'     => 'WORDPRESS_DB_USER',
+	'DB_PASSWORD' => 'WORDPRESS_DB_PASSWORD',
+	'DB_HOST'     => 'WORDPRESS_DB_HOST',
+);
+foreach ( $map as $const => $env ) {
+	$literal = '/define\(\s*([\'"])' . $const . '\1\s*,\s*(?:\'(?:[^\'\\\\]|\\\\.)*\'|"(?:[^"\\\\]|\\\\.)*")\s*\)\s*;/';
+	$n       = 0;
+	$src     = preg_replace( $literal, "define( '$const', getenv( '$env' ) );", $src, -1, $n );
+	if ( $n > 0 ) {
+		$changes[] = "$const -> getenv($env)";
+	} elseif ( ! preg_match( '/define\(\s*[\'"]' . $const . '[\'"]\s*,\s*getenv\(\s*\'' . $env . '\'\s*\)\s*\)/', $src ) ) {
+		fwrite( STDERR, "wpr-wpconfig: ERRO: define de $const não reconhecido em $file\n" );
+		exit( 2 );
+	}
+}
+
+$marker = '// >>> railway';
+if ( false === strpos( $src, $marker ) ) {
+	$block = <<<'PHP'
+// >>> railway (wordpress-railway). Banco vem das variáveis do serviço; sem senha aqui.
+if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && false !== stripos( $_SERVER['HTTP_X_FORWARDED_PROTO'], 'https' ) ) {
+	$_SERVER['HTTPS'] = 'on';
+}
+// WP-Cron não roda pelo endereço provisório *.up.railway.app (nem com WP_DISABLE_CRON=1): antes da virada
+// a cópia não publica agendados nem chama APIs externas; no domínio oficial volta a rodar sozinho.
+if ( ! defined( 'DISABLE_WP_CRON' ) && ( '1' === getenv( 'WP_DISABLE_CRON' )
+	|| preg_match( '/\.up\.railway\.app(?::\d+)?$/i', isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : '' ) ) ) {
+	define( 'DISABLE_WP_CRON', true );
+}
+// <<< railway
+PHP;
+	$n   = 0;
+	$src = preg_replace( '/\A(<\?php)[ \t]*\r?\n/', "$1\n" . $block . "\n", $src, 1, $n );
+	if ( 1 !== $n ) {
+		fwrite( STDERR, "wpr-wpconfig: ERRO: wp-config não começa com <?php\n" );
+		exit( 3 );
+	}
+	$changes[] = 'bloco railway inserido (X-Forwarded-Proto, WP_DISABLE_CRON)';
+}
+
+if ( preg_match( '/define\(\s*[\'"]DB_PASSWORD[\'"]\s*,\s*[\'"]/', $src ) ) {
+	fwrite( STDERR, "wpr-wpconfig: ERRO: ainda há senha literal\n" );
+	exit( 4 );
+}
+
+if ( $check ) {
+	echo $src === $orig ? "wp-config: já ajustado\n" : "wp-config: PRECISA de ajuste (" . implode( '; ', $changes ) . ")\n";
+	exit( $src === $orig ? 0 : 10 );
+}
+if ( $src === $orig ) {
+	echo "wp-config: já ajustado (nada a fazer)\n";
+	exit( 0 );
+}
+$st  = is_file( $file ) ? stat( $file ) : array( 'mode' => 0644, 'uid' => 33, 'gid' => 33 );
+$tmp = dirname( $file ) . '/.wp-config.railway-tmp';
+if ( false === file_put_contents( $tmp, $src ) ) {
+	fwrite( STDERR, "wpr-wpconfig: falha ao gravar\n" );
+	exit( 5 );
+}
+chmod( $tmp, $st['mode'] & 07777 );
+if ( function_exists( 'chown' ) && function_exists( 'chgrp' ) ) { // (desabilitadas em hospedagem compartilhada)
+	@chown( $tmp, $st['uid'] );
+	@chgrp( $tmp, $st['gid'] );
+}
+try {
+	token_get_all( $src, TOKEN_PARSE ); // lint no próprio processo (ParseError se a sintaxe quebrar)
+} catch ( \ParseError $e ) {
+	@unlink( $tmp );
+	fwrite( STDERR, "wpr-wpconfig: ERRO de sintaxe no resultado (linha " . $e->getLine() . "); nada alterado\n" );
+	exit( 6 );
+}
+rename( $tmp, $file );
+echo 'wp-config ajustado: ' . implode( '; ', $changes ) . "\n";

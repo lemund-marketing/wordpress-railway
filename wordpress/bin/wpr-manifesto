@@ -1,0 +1,26 @@
+#!/bin/bash
+# Manifesto de uma árvore: 1 linha por item, ordenado (LC_ALL=C). Roda igual na origem (ex.: hospedagem
+# compartilhada) e no contêiner, para comparar origem x destino com diff. Não cria arquivo nenhum (sem process
+# substitution: a CageFS de hospedagem compartilhada não tem /dev/fd). Formato:
+#   D <caminho>                    pasta
+#   L <caminho> -> <alvo>          link simbólico
+#   F <sha256> <bytes> <caminho>   arquivo   (com --sem-hash o sha256 vira "-")
+# Uso: wpr-manifesto <pasta> [--sem-hash]
+set -euo pipefail
+dir="${1:?pasta}"; modo="${2:-}"
+cd "$dir"
+export LC_ALL=C
+{
+  find . -mindepth 1 -type d -printf 'D %P\n'
+  find . -mindepth 1 -type l -printf 'L %P -> %l\n'
+  if [ "$modo" = "--sem-hash" ]; then
+    find . -mindepth 1 -type f -printf 'F - %s %P\n'
+  else
+    {
+      find . -mindepth 1 -type f -printf 'S\t%P\t%s\n'
+      find . -mindepth 1 -type f -print0 | nice -n 19 xargs -0 -r sha256sum \
+        | sed -E 's#^\\?([0-9a-f]{64}) [ *]\./(.*)$#H\t\2\t\1#'
+    } | awk -F'\t' '$1=="S"{s[$2]=$3; next} $1=="H"{h[$2]=$3; next}
+                    END{for (p in s) print "F " ((p in h) ? h[p] : "SEM-HASH") " " s[p] " " p}'
+  fi
+} | sort

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Copia os mu-plugins da Railway (pré-visualização e SMTP) para o site, se já houver wp-content.
+set -euo pipefail
+DOCROOT="${WPR_DOCROOT:-/var/www/html}"
+src=/usr/local/share/wpr/mu-plugins
+if [ -d "$DOCROOT/wp-content" ]; then
+  mkdir -p "$DOCROOT/wp-content/mu-plugins"
+  chown www-data:www-data "$DOCROOT/wp-content/mu-plugins"
+  for f in "$src"/railway-*.php; do
+    install -o www-data -g www-data -m 0644 "$f" "$DOCROOT/wp-content/mu-plugins/$(basename "$f")"
+  done
+  echo "[mu-plugins] railway-*.php instalados"
+fi

@@ -1,0 +1,7 @@
+# nada de dados de site, dumps ou segredos neste repositório público
+*.sql
+*.sql.gz
+*.tar
+*.tar.gz
+.env*
+.DS_Store

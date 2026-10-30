@@ -1,0 +1,74 @@
+#!/bin/bash
+# Entrypoint do WordPress (imagem wordpress-railway). Prepara o contêiner e entrega para o Apache.
+# Não mexe no conteúdo do site, só: porta, atalho do caminho antigo (CAMINHO_ANTIGO), autorrestauração
+# (só com RESTAURAR_*; ver wpr-restaurar), auto_prepend (ex.: Wordfence), filtro da pré-visualização,
+# mu-plugins da Railway e dono dos arquivos.
+set -euo pipefail
+DOCROOT=/var/www/html
+export APACHE_MAX_WORKERS="${APACHE_MAX_WORKERS:-25}"
+PORT="${PORT:-80}"
+log() { echo "[entrypoint] $*"; }
+
+# caminho absoluto do docroot no servidor antigo (ex.: /home/<usuário>/domains/<site>/public_html)
+CAMINHO_ANTIGO="${CAMINHO_ANTIGO:-${HOSTINGER_DOCROOT:-}}"
+case "$CAMINHO_ANTIGO" in
+  "") ;;
+  /var/www|/var/www/*|/|/usr|/usr/*|/etc|/etc/*|/bin|/bin/*|/sbin|/sbin/*|/proc|/proc/*|/dev|/dev/*)
+    log "AVISO: CAMINHO_ANTIGO=$CAMINHO_ANTIGO não é permitido (área do sistema ou do próprio volume); ignorado"
+    CAMINHO_ANTIGO="" ;;
+  /*) ;;
+  *) log "AVISO: CAMINHO_ANTIGO precisa ser um caminho absoluto; ignorado"; CAMINHO_ANTIGO="" ;;
+esac
+export CAMINHO_ANTIGO
+
+if [ "$PORT" != "80" ]; then
+  sed -ri "s/^Listen 80\$/Listen ${PORT}/" /etc/apache2/ports.conf
+  sed -ri "s/<VirtualHost \*:80>/<VirtualHost *:${PORT}>/" /etc/apache2/sites-available/000-default.conf
+fi
+
+mkdir -p "$DOCROOT"
+chown www-data:www-data "$DOCROOT" /var/www
+
+# Atalho de compatibilidade: CAMINHO_ANTIGO -> /var/www/html
+# (logs, caches e configs regeneráveis que guardaram o caminho antigo continuam resolvendo)
+if [ -n "$CAMINHO_ANTIGO" ]; then
+  if [ -d "$CAMINHO_ANTIGO" ] && [ ! -L "$CAMINHO_ANTIGO" ]; then
+    log "AVISO: $CAMINHO_ANTIGO já existe como pasta de verdade; atalho não criado"
+  else
+    mkdir -p "$(dirname "$CAMINHO_ANTIGO")"
+    ln -sfn "$DOCROOT" "$CAMINHO_ANTIGO"
+  fi
+fi
+
+# Autorrestauração (RESTAURAR_*): roda ANTES do Apache; sem as variáveis não faz nada.
+if ! wpr-restaurar; then
+  log "ERRO: a restauração automática falhou (detalhes acima). O site NÃO foi iniciado e nada foi marcado como restaurado."
+  log "Corrija as variáveis RESTAURAR_* (ou remova-as) e reimplante."
+  exit 1
+fi
+
+# auto_prepend_file (ex.: Wordfence "proteção estendida"): na hospedagem vinha do .htaccess (bloco LiteSpeed);
+# no Apache vem do php.ini
+ini="$PHP_INI_DIR/conf.d/zz-auto-prepend.ini"
+rm -f "$ini"
+if [ -n "${PHP_AUTO_PREPEND_FILE:-}" ]; then
+  if [ -f "$PHP_AUTO_PREPEND_FILE" ]; then
+    printf 'auto_prepend_file = "%s"\n' "$PHP_AUTO_PREPEND_FILE" > "$ini"
+    log "auto_prepend_file = $PHP_AUTO_PREPEND_FILE"
+  else
+    log "AVISO: PHP_AUTO_PREPEND_FILE=$PHP_AUTO_PREPEND_FILE não existe (ainda); ignorado"
+  fi
+fi
+
+wpr-preview-apache
+wpr-bloqueios-apache
+wpr-mu-plugins
+
+# dono: só corre a árvore inteira se achar algo fora do www-data
+if [ -n "$(find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -print -quit 2>/dev/null)" ]; then
+  log "corrigindo dono dos arquivos para www-data"
+  find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -exec chown -h www-data:www-data {} +
+fi
+
+log "docroot: $(find "$DOCROOT" -mindepth 1 -maxdepth 1 | wc -l) itens no 1º nível; PHP $(php -r 'echo PHP_VERSION;'); porta $PORT"
+exec "$@"

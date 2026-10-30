@@ -1,0 +1,68 @@
+#!/bin/bash
+# Roda DENTRO do contêiner depois de cada cópia/sincronização de arquivos (e na autorrestauração). Idempotente.
+#  1. wp-config: banco pelas variáveis (sem senha no arquivo) + HTTPS atrás do proxy
+#  2. symlinks absolutos para o caminho antigo (CAMINHO_ANTIGO/...) -> relativos
+#  3. caminho absoluto antigo trocado nos .htaccess (ex.: Wordfence auto_prepend dentro de <IfModule LiteSpeed>)
+#  4. mu-plugin de auto-update da hospedagem (hostinger-auto-updates.php, desvia updates p/ 127.0.0.1:7777)
+#     renomeado para .desativado-railway (MANTER_MU_HOSTINGER=1 mantém)
+#  5. mu-plugins da Railway + dono www-data
+#  6. (serviço com PHP_AUTO_PREPEND_FILE) liga o auto_prepend se o arquivo chegou depois do boot (graceful do Apache)
+# Variáveis internas: WPR_DOCROOT = pasta onde agir (padrão /var/www/html); WPR_DOCROOT_FINAL = caminho que ela terá
+# quando estiver no ar (a autorrestauração prepara uma pasta temporária e só depois troca pelo docroot).
+set -euo pipefail
+DOCROOT="${WPR_DOCROOT:-/var/www/html}"
+FINAL="${WPR_DOCROOT_FINAL:-$DOCROOT}"
+OLD="${CAMINHO_ANTIGO:-${HOSTINGER_DOCROOT:-}}"
+OLD="${OLD%/}"
+log() { echo "[pos-copia] $*"; }
+
+if [ -f "$DOCROOT/wp-config.php" ]; then wpr-wpconfig "$DOCROOT/wp-config.php"; fi
+
+if [ -n "$OLD" ]; then
+  # (pipes em vez de "< <(...)": a CageFS de hospedagem compartilhada não tem /dev/fd e o teste pode rodar lá também)
+  find "$DOCROOT" -type l -print0 | while IFS= read -r -d '' l; do
+    t="$(readlink "$l")"
+    case "$t" in
+      "$OLD"|"$OLD"/*)
+        new="$DOCROOT${t#"$OLD"}"
+        rel="$(realpath -m --relative-to="$(dirname "$l")" "$new")"
+        ln -sfn "$rel" "$l"; chown -h www-data:www-data "$l" 2>/dev/null || true
+        log "symlink ${l#"$DOCROOT"/}: $t -> $rel" ;;
+    esac
+  done
+  old_re="$(printf '%s' "$OLD" | sed 's/[][\.*^$#]/\\&/g')"
+  final_rep="$(printf '%s' "$FINAL" | sed 's/[\&#]/\\&/g')"
+  find "$DOCROOT" -name .htaccess -type f -print0 | while IFS= read -r -d '' h; do
+    if grep -qF "$OLD" "$h"; then sed -i "s#${old_re}#${final_rep}#g" "$h"; log "caminho antigo trocado em ${h#"$DOCROOT"/}"; fi
+  done
+fi
+
+mu="$DOCROOT/wp-content/mu-plugins/hostinger-auto-updates.php"
+if [ -f "$mu" ] && [ "${MANTER_MU_HOSTINGER:-0}" != "1" ]; then
+  mv -f "$mu" "$mu.desativado-railway"; log "desativado mu-plugins/hostinger-auto-updates.php (arquivo mantido como .desativado-railway)"
+fi
+
+# 6. auto_prepend (ex.: Wordfence): no 1º boot o volume estava vazio e o entrypoint não ligou o auto_prepend. Agora
+#    que o arquivo chegou, liga e recarrega o Apache (graceful: não derruba conexões). Se o Apache não estiver rodando
+#    ou não recarregar, o próximo boot (redeploy, sem build) liga. Na autorrestauração (pasta temporária) quem liga é
+#    o entrypoint, logo depois.
+ini_dir="${PHP_INI_DIR:-/usr/local/etc/php}/conf.d"
+if [ "$FINAL" = "$DOCROOT" ] && [ -n "${PHP_AUTO_PREPEND_FILE:-}" ] && [ -d "$ini_dir" ] && [ -f "$PHP_AUTO_PREPEND_FILE" ] \
+   && [ ! -f "$ini_dir/zz-auto-prepend.ini" ]; then
+  printf 'auto_prepend_file = "%s"\n' "$PHP_AUTO_PREPEND_FILE" > "$ini_dir/zz-auto-prepend.ini"
+  pidf="/var/run/apache2/apache2.pid"
+  if command -v apache2ctl >/dev/null 2>&1 && [ -s "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null \
+     && apache2ctl -k graceful >/dev/null 2>&1; then
+    log "auto_prepend_file = $PHP_AUTO_PREPEND_FILE ligado (Apache recarregado)"
+  else
+    log "AVISO: auto_prepend_file gravado, mas o Apache não recarregou -> reimplante o serviço (redeploy, sem build)"
+  fi
+fi
+
+if id www-data >/dev/null 2>&1; then   # (fora do contêiner, ex. teste na hospedagem, pula esta parte)
+  WPR_DOCROOT="$DOCROOT" wpr-mu-plugins
+  n="$(find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -print | wc -l)"
+  if [ "$n" -gt 0 ]; then find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -exec chown -h www-data:www-data {} +; fi
+  log "dono corrigido em $n itens"
+fi
+log ok

@@ -1,0 +1,10 @@
+# Ajustes para WordPress, equivalentes ao MariaDB 11.8 de hospedagem compartilhada comum
+[mariadbd]
+# volume montado em /var/lib/mysql; os dados ficam numa subpasta (fora do lost+found do volume)
+datadir                 = /var/lib/mysql/data
+sql_mode                = NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+max_allowed_packet      = 1G
+character-set-server    = utf8mb4
+collation-server        = utf8mb4_unicode_ci
+innodb_buffer_pool_size = 256M
+skip-name-resolve

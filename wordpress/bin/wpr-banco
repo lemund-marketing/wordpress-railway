@@ -1,0 +1,35 @@
+#!/bin/bash
+# Banco do site (MariaDB pela rede privada), com as credenciais das variáveis WORDPRESS_DB_* do serviço.
+#   wpr-banco importar [arquivo.sql.gz]  -> apaga TODAS as tabelas do banco do site e importa o dump (stdin se omitido)
+#   wpr-banco conferir                   -> tabela, linhas, CHECKSUM, engine, collation (para comparar com a origem)
+#   wpr-banco shell                      -> cliente mariadb interativo
+#   wpr-banco limpar --sim               -> apaga TODAS as tabelas do banco do site (usado após testes)
+# Nunca imprime a senha (vai por MYSQL_PWD).
+set -euo pipefail
+export LC_ALL=C
+: "${WORDPRESS_DB_HOST:?falta WORDPRESS_DB_HOST}" "${WORDPRESS_DB_NAME:?falta WORDPRESS_DB_NAME}"
+: "${WORDPRESS_DB_USER:?falta WORDPRESS_DB_USER}" "${WORDPRESS_DB_PASSWORD:?falta WORDPRESS_DB_PASSWORD}"
+host="${WORDPRESS_DB_HOST%:*}"; port="${WORDPRESS_DB_HOST##*:}"; [ "$port" = "$WORDPRESS_DB_HOST" ] && port=3306
+export MYSQL_PWD="$WORDPRESS_DB_PASSWORD"
+args=(-h "$host" -P "$port" -u "$WORDPRESS_DB_USER")
+db="$WORDPRESS_DB_NAME"
+case "${1:-}" in
+  importar)
+    src="${2:--}"
+    [ "$src" = "-" ] || [ -f "$src" ] || { echo "não achei $src" >&2; exit 2; }
+    drops="$(mariadb "${args[@]}" -N -B "$db" -e "SELECT CONCAT('DROP ', IF(table_type='VIEW','VIEW','TABLE'), ' IF EXISTS \`', table_name, '\`;') FROM information_schema.tables WHERE table_schema=DATABASE()")"
+    { echo 'SET FOREIGN_KEY_CHECKS=0;'; printf '%s\n' "$drops"; } | mariadb "${args[@]}" "$db"
+    echo "[banco] $db esvaziado ($(printf '%s' "$drops" | grep -c . || true) objetos); importando..." >&2
+    t0=$(date +%s)
+    if [ "$src" = "-" ]; then gzip -dc; else gzip -dc "$src"; fi | mariadb "${args[@]}" --max-allowed-packet=1G "$db"
+    echo "[banco] importado em $(( $(date +%s) - t0 ))s: $(mariadb "${args[@]}" -N -B "$db" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()") tabelas" >&2
+    ;;
+  conferir) wpr-banco-conferir-sql "${args[@]}" "$db" ;;
+  limpar)
+    [ "${2:-}" = "--sim" ] || { echo "confirme com: wpr-banco limpar --sim" >&2; exit 2; }
+    drops="$(mariadb "${args[@]}" -N -B "$db" -e "SELECT CONCAT('DROP ', IF(table_type='VIEW','VIEW','TABLE'), ' IF EXISTS \`', table_name, '\`;') FROM information_schema.tables WHERE table_schema=DATABASE()")"
+    { echo 'SET FOREIGN_KEY_CHECKS=0;'; printf '%s\n' "$drops"; } | mariadb "${args[@]}" "$db"
+    echo "[banco] $db esvaziado" >&2 ;;
+  shell) exec mariadb "${args[@]}" "$db" ;;
+  *) sed -n '2,7p' "$0"; exit 2 ;;
+esac

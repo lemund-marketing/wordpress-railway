@@ -1,0 +1,26 @@
+#!/bin/bash
+# Bloqueio OPCIONAL de download de arquivos que hoje são públicos e não deveriam ser (ex.: um backup .zip esquecido
+# no docroot, um debug.log). Os arquivos continuam no volume; o Apache só passa a responder 403 para eles.
+# Padrão: nada bloqueado.
+#   BLOQUEAR_ARQUIVOS="backup.zip debug.log"   (nomes de arquivo, separados por espaço; vale em qualquer pasta)
+# Aplicar/alterar: mudar a variável no serviço e reimplantar (sem build).
+set -euo pipefail
+conf="${WPR_BLOQUEIOS_CONF:-/etc/apache2/conf-enabled/zz-wpr-bloqueios.conf}"
+rm -f "$conf"
+[ -n "${BLOQUEAR_ARQUIVOS:-}" ] || exit 0
+re=""; aceitos=""
+for n in $BLOQUEAR_ARQUIVOS; do
+  # só nomes simples (letras, números, ponto, hífen, sublinhado): nada de caminho, curinga ou aspas
+  if ! printf '%s' "$n" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+    echo "[bloqueios] ignorado (nome inválido): $n"; continue
+  fi
+  re="${re:+$re|}$(printf '%s' "$n" | sed 's/\./\\./g')"; aceitos="$aceitos $n"
+done
+[ -n "$re" ] || exit 0
+{
+  echo "# gerado pelo wpr-bloqueios-apache a partir de BLOQUEAR_ARQUIVOS"
+  echo "<FilesMatch \"^($re)\$\">"
+  echo "    Require all denied"
+  echo "</FilesMatch>"
+} > "$conf"
+echo "[bloqueios] download negado (403) para:$aceitos"
