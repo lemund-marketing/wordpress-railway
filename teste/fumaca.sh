@@ -72,6 +72,7 @@ db_run "origem teste extra"
 esperar_login extra "$PW_EXTRA" 180 || falha "o banco/usuário extra não foi criado no boot seguinte"
 esperar_login teste "$PW_TESTE" 20 || falha "o usuário teste parou de conectar"
 ok "banco extra criado no 2º boot; os anteriores seguem"
+docker logs "$ID-db" 2>&1 | grep -E '\[bancos\]|bancos prontos' | sed 's/^/    /' || true
 
 # ------------------------------------------------------------------------------- site de origem
 passo "Site de origem: WordPress de verdade criado com o wp-cli da imagem (sem RESTAURAR_*)"
@@ -184,6 +185,10 @@ titulo() { local p; p="$(pagina || true)"; printf '%s' "$p" | grep -o '<title>[^
 marca() { dx sh -c "head -n 1 /var/www/.wpr-restauracao/$1 2>/dev/null" || true; }
 logs() { docker logs "$ID-destino" 2>&1; }
 blogname() { db_sql teste "$PW_TESTE" "SELECT option_value FROM wp_options WHERE option_name='blogname'"; }
+mostrar_log() { # o que o dono do serviço vê no log da Railway
+  echo "  --- log do contêiner (linhas da imagem):"
+  logs | grep -E '^\[(restaurar|entrypoint|pos-copia|banco|mu-plugins|preview|bloqueios)\]' | sed 's/^/    /' || true
+}
 
 passo "1. Volume vazio + RESTAURAR_* (versão 1): restaura sozinho"
 destino 1 "http://arquivos:8000/v1"
@@ -207,6 +212,7 @@ h="$(pagina teste-123.up.railway.app)"; grep -qi '^x-railway-preview: 1' <<<"$h"
 l="$(logs)"
 if grep -qF -e "$SRVPW" -e "$PW_TESTE" -e "$PW_ORIGEM" -e "/v1/" <<<"$l"; then falha "o log mostrou senha ou URL completa"; fi
 ok "wp-config pelo ambiente, symlink relativo, .htaccess, pasta irmã, atalho antigo, dono, mu-plugins, auto_prepend, preview, marcadores, log sem segredo"
+mostrar_log
 
 passo "2. Reiniciar não restaura de novo"
 dx touch /var/www/html/sentinela.txt
@@ -250,6 +256,7 @@ done
 rc="$(docker inspect -f '{{.State.ExitCode}}' "$ID-destino")"
 [ "$rc" != 0 ] || falha "o contêiner saiu com código 0"
 grep -q "sha256 diferente do informado" <<<"$(logs)" || falha "log sem o motivo (sha256)"
+mostrar_log
 [ "$(blogname)" = "Site Teste Dois" ] || falha "o banco foi alterado apesar do sha256 errado"
 destino 2 "http://arquivos:8000/v2"
 esperar_site
@@ -258,6 +265,35 @@ t="$(titulo)"; [ "$t" = "Site Teste Dois" ] || falha "o site mudou depois da fal
 dx test -f /var/www/html/versao2.txt || falha "arquivos alterados depois da falha"
 if dx sh -c 'ls -d /var/www/.wpr-tmp-* >/dev/null 2>&1'; then falha "temporários da tentativa falha ficaram no volume"; fi
 ok "saiu com código $rc, site e marcadores da versão 2 intactos"
+
+passo "6. Importação do banco interrompida (marcador 'em andamento'): o boot seguinte refaz, mesmo sem SOBRESCREVER"
+dx sh -c 'echo 2 > /var/www/.wpr-restauracao/banco.em-andamento'
+dx touch /var/www/html/sentinela6.txt
+antes="$(docker logs "$ID-arquivos" 2>&1 | grep -c '"GET /v2/site-banco.sql.gz HTTP/1.1" 200' || true)"
+docker restart "$ID-destino" >/dev/null
+esperar_site
+depois="$(docker logs "$ID-arquivos" 2>&1 | grep -c '"GET /v2/site-banco.sql.gz HTTP/1.1" 200' || true)"
+[ "$depois" -gt "$antes" ] || falha "o banco não foi baixado de novo"
+grep -q "refazer a importação interrompida" <<<"$(logs)" || falha "log sem 'refazer a importação interrompida'"
+if dx test -e /var/www/.wpr-restauracao/banco.em-andamento; then falha "marcador 'em andamento' não foi apagado"; fi
+dx test -f /var/www/html/sentinela6.txt || falha "os arquivos não deveriam ter sido trocados"
+[ "$(blogname)" = "Site Teste Dois" ] || falha "banco errado depois de refazer"
+ok "banco reimportado, arquivos intactos"
+
+passo "7. Banco fora do ar num boot comum (versão já restaurada): o site sobe mesmo assim"
+docker stop "$ID-db" >/dev/null
+docker restart "$ID-destino" >/dev/null
+for i in $(seq 1 45); do
+  grep -q "seguindo sem conferir" <<<"$(logs)" && [ "$(codigo)" != 000 ] && [ -n "$(codigo)" ] && break
+  sleep 2
+done
+grep -q "seguindo sem conferir" <<<"$(logs)" || falha "o boot ficou preso esperando o banco"
+[ "$(docker inspect -f '{{.State.Status}}' "$ID-destino")" = running ] || falha "o contêiner parou com o banco fora"
+c="$(codigo)"; case "$c" in 000|000000|"") falha "o Apache não subiu com o banco fora" ;; esac
+docker start "$ID-db" >/dev/null
+esperar_login teste "$PW_TESTE" 120 || falha "o banco não voltou"
+esperar_site
+ok "Apache no ar com o banco fora (home $c) e de volta a 200 quando o banco voltou"
 
 echo
 echo "TESTE DE FUMAÇA: TUDO OK ($WP + $DB)"
