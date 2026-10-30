@@ -1,8 +1,9 @@
 name: alcance
 
 # Testa, a partir de um runner do GitHub (fora da nossa rede), se uma URL protegida por HTTP Basic Auth é alcançável:
-# passa só se a resposta for 401 vinda da ORIGEM (sem cf-mitigated e sem página de desafio da Cloudflare).
-# A URL não aparece no log (fica mascarada; só o host é mostrado).
+# passa só se a resposta for 401 vinda da ORIGEM (WWW-Authenticate Basic, sem cf-mitigated e sem página de desafio
+# da Cloudflare). Este repositório é público: a URL inteira (host e caminho) fica mascarada e nada que identifique o
+# site (host, realm do Basic Auth) vai para o log nem para o resumo da execução.
 on:
   workflow_dispatch:
     inputs:
@@ -28,21 +29,24 @@ jobs:
           [ -n "$url" ] || { echo "informe a url"; exit 1; }
           echo "::add-mask::$url"
           resto="${url#*://}"; resto="${resto##*@}"; host="${resto%%/*}"; caminho="${resto#"$host"}"
+          if [ -n "$host" ]; then echo "::add-mask::$host"; fi
           if [ -n "${caminho#/}" ]; then echo "::add-mask::${caminho#/}"; fi
           case "$url" in https://*|http://*) ;; *) echo "a URL precisa começar com https://"; exit 1 ;; esac
-          echo "alvo: host ${host} (caminho mascarado)"
+          echo "alvo: (host e caminho mascarados)"
 
-          status="$(curl -sS -I --max-time 30 -o cab.txt -w '%{http_code}' "$url" || true)"
+          status="$(curl -sS -I --max-time 30 -o cab.txt -w '%{http_code}' "$url" 2>/dev/null || true)"
           valor() { grep -i "^$1:" cab.txt | head -n 1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//' || true; }
-          server="$(valor server)"; ray="$(valor cf-ray)"; mit="$(valor cf-mitigated)"; auth="$(valor www-authenticate)"
+          server="$(valor server)"; ray="$(valor cf-ray)"; mit="$(valor cf-mitigated)"
+          # do WWW-Authenticate só o esquema (o realm pode ter o nome do site)
+          auth="$(valor www-authenticate | awk '{print $1}')"
           echo "status:           ${status:-sem resposta}"
           echo "server:           ${server:--}"
           echo "cf-ray:           ${ray:--}"
           echo "cf-mitigated:     ${mit:--}"
-          echo "www-authenticate: ${auth:--}"
+          echo "www-authenticate: ${auth:--} (realm omitido)"
 
           # GET sem senha: a página de desafio da Cloudflare (403/503 com JS) não pode aparecer
-          get_status="$(curl -sS --max-time 30 -o corpo.html -w '%{http_code}' "$url" || true)"
+          get_status="$(curl -sS --max-time 30 -o corpo.html -w '%{http_code}' "$url" 2>/dev/null || true)"
           desafio=nao
           if grep -qiE 'cf-chl|challenge-platform|cf_chl_opt|Just a moment|Attention Required' corpo.html 2>/dev/null; then desafio=sim; fi
           echo "GET sem senha:    ${get_status:-sem resposta} (página de desafio da Cloudflare: $desafio)"
@@ -51,18 +55,16 @@ jobs:
             echo "### alcance"
             echo "| campo | valor |"
             echo "|---|---|"
-            echo "| host | ${host} |"
             echo "| status (HEAD) | ${status:-sem resposta} |"
             echo "| server | ${server:--} |"
-            echo "| cf-ray | ${ray:--} |"
             echo "| cf-mitigated | ${mit:--} |"
             echo "| www-authenticate | ${auth:--} |"
             echo "| GET sem senha | ${get_status:-sem resposta} (desafio: $desafio) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$status" = 401 ] && [ -z "$mit" ] && [ "$desafio" = nao ]; then
+          if [ "$status" = 401 ] && [ -z "$mit" ] && [ "$desafio" = nao ] && [ "${auth,,}" = basic ]; then
             echo "OK: 401 da origem (o runner alcança a pasta e a senha é exigida)"
           else
-            echo "FALHOU: esperado 401 da origem, sem cf-mitigated e sem desafio da Cloudflare"
+            echo "FALHOU: esperado 401 da origem com WWW-Authenticate Basic, sem cf-mitigated e sem desafio da Cloudflare"
             exit 1
           fi

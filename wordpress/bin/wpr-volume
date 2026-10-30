@@ -1,0 +1,20 @@
+#!/bin/bash
+# Diz se /var/www está num volume (disco que sobrevive ao redeploy). Usado pelo wpr-entrypoint (só avisa) e pelo
+# wpr-restaurar (recusa restaurar fora de um volume).
+#   saída 0: /var/www é ponto de montagem (volume no lugar certo)
+#   saída 1: nenhum volume em /var/www (o que for gravado some no próximo deploy)
+#   saída 2: há um volume em /var/www/html (o docroot): o certo é montar em /var/www
+# Critério: o caminho aparece como ponto de montagem em /proc/self/mountinfo OU está noutro dispositivo que a pasta
+# de cima (qualquer um dos dois basta, para não recusar um volume de verdade por engano).
+set -uo pipefail
+montado() { # caminho
+  [ -d "$1" ] || return 1
+  if awk -v p="$1" '$5 == p { f = 1 } END { exit !f }' /proc/self/mountinfo 2>/dev/null; then return 0; fi
+  local d p
+  d="$(stat -c %d "$1" 2>/dev/null)" || return 1
+  p="$(stat -c %d "$(dirname "$1")" 2>/dev/null)" || return 1
+  [ "$d" != "$p" ]
+}
+if montado /var/www/html; then exit 2; fi
+if montado /var/www; then exit 0; fi
+exit 1

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Banco do site (MariaDB pela rede privada), com as credenciais das variáveis WORDPRESS_DB_* do serviço.
 #   wpr-banco importar [arquivo.sql.gz]  -> apaga TODAS as tabelas do banco do site e importa o dump (stdin se omitido)
+#   wpr-banco exportar [arquivo.sql.gz]  -> mariadb-dump do banco do site, gzip (stdout se omitido)
 #   wpr-banco conferir                   -> tabela, linhas, CHECKSUM, engine, collation (para comparar com a origem)
 #   wpr-banco shell                      -> cliente mariadb interativo
 #   wpr-banco limpar --sim               -> apaga TODAS as tabelas do banco do site (usado após testes)
@@ -24,6 +25,13 @@ case "${1:-}" in
     if [ "$src" = "-" ]; then gzip -dc; else gzip -dc "$src"; fi | mariadb "${args[@]}" --max-allowed-packet=1G "$db"
     echo "[banco] importado em $(( $(date +%s) - t0 ))s: $(mariadb "${args[@]}" -N -B "$db" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()") tabelas" >&2
     ;;
+  exportar)
+    dest="${2:--}"
+    # mesmas opções do dump da hospedagem (termina com "-- Dump completed")
+    dump=(mariadb-dump "${args[@]}" --single-transaction --quick --routines --triggers --hex-blob
+          --default-character-set=utf8mb4 --no-tablespaces --max-allowed-packet=1G --add-drop-table "$db")
+    if [ "$dest" = "-" ]; then "${dump[@]}" | gzip -6; else "${dump[@]}" | gzip -6 > "$dest"; fi
+    ;;
   conferir) wpr-banco-conferir-sql "${args[@]}" "$db" ;;
   limpar)
     [ "${2:-}" = "--sim" ] || { echo "confirme com: wpr-banco limpar --sim" >&2; exit 2; }
@@ -31,5 +39,5 @@ case "${1:-}" in
     { echo 'SET FOREIGN_KEY_CHECKS=0;'; printf '%s\n' "$drops"; } | mariadb "${args[@]}" "$db"
     echo "[banco] $db esvaziado" >&2 ;;
   shell) exec mariadb "${args[@]}" "$db" ;;
-  *) sed -n '2,7p' "$0"; exit 2 ;;
+  *) sed -n '2,8p' "$0"; exit 2 ;;
 esac

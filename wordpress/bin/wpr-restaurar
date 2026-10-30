@@ -10,17 +10,25 @@
 #   RESTAURAR_ARQUIVOS_SHA256   opcional: se diferente do baixado, aborta sem tocar no site
 #   RESTAURAR_BANCO_SHA256      idem para o banco
 #   RESTAURAR_VERSAO            texto livre (padrão "1"): marca o que já foi restaurado
-#   RESTAURAR_SOBRESCREVER      "sim": substitui conteúdo existente quando a VERSAO muda (sincronização final)
+#   RESTAURAR_SOBRESCREVER      "sim": substitui conteúdo existente quando o pedido é novo (sincronização final)
 #   RESTAURAR_ESPERA_BANCO      segundos de espera pelo banco (padrão 300)
+#   RESTAURAR_SEM_VOLUME        "sim": restaura mesmo sem volume em /var/www (só para teste local)
 #
+# Pedido novo = RESTAURAR_VERSAO diferente da marcada OU RESTAURAR_*_SHA256 informado e diferente do sha256 marcado
+# (assim um pacote novo com sha256 novo não passa despercebido se a VERSAO ficou igual).
 # Regras (arquivos e banco decididos separadamente):
 #   - volume sem conteúdo / banco sem tabelas            => restaura;
-#   - mesma VERSAO já restaurada                          => não faz nada (reiniciar não restaura de novo);
-#   - conteúdo existente + VERSAO nova sem SOBRESCREVER   => não toca e avisa no log;
-#   - conteúdo existente + VERSAO nova + SOBRESCREVER=sim => substitui.
+#   - mesmo pedido já restaurado                          => não faz nada (reiniciar não restaura de novo);
+#                                                            com SOBRESCREVER=sim, avisa que ele foi ignorado;
+#   - conteúdo existente + pedido novo sem SOBRESCREVER   => não toca e avisa no log;
+#   - conteúdo existente + pedido novo + SOBRESCREVER=sim => substitui.
+#   Exige que /var/www seja um volume (wpr-volume); senão recusa sem mexer em nada.
 #   Tudo é baixado e conferido (sha256, gzip, fim do dump, extração, wp-config) ANTES de mexer no site. Os arquivos
-#   entram por troca de pasta (o site nunca fica pela metade). Qualquer falha => sai com erro e não marca.
-#   Marcadores: /var/www/.wpr-restauracao/{arquivos,banco} (1ª linha = VERSAO). Temporários: /var/www/.wpr-tmp-*.
+#   entram por troca de pasta (o site nunca fica pela metade). Para substituir um banco que já tem tabelas, uma
+#   cópia dele é guardada antes (.wpr-restauracao/banco-anterior.sql.gz); se a importação falhar, essa cópia é
+#   devolvida. Qualquer falha => sai com erro e não marca.
+#   Marcadores: /var/www/.wpr-restauracao/{arquivos,banco} (1ª linha = VERSAO, 3ª = sha256). Temporários:
+#   /var/www/.wpr-tmp-*.
 # Nunca imprime senha nem a URL completa (só esquema, host e nome do arquivo).
 set -euo pipefail
 export LC_ALL=C
@@ -30,6 +38,16 @@ CTRL="$BASE/.wpr-restauracao"
 URL_ARQ="${RESTAURAR_ARQUIVOS_URL:-}"
 URL_BANCO="${RESTAURAR_BANCO_URL:-}"
 [ -n "$URL_ARQ$URL_BANCO" ] || exit 0
+
+# fora de um volume, o que for restaurado some no próximo deploy (e os marcadores também: restauraria a cada boot)
+if [ "${RESTAURAR_SEM_VOLUME:-}" != sim ]; then
+  vrc=0; wpr-volume || vrc=$?
+  case "$vrc" in
+    0) ;;
+    2) echo "[restaurar] ERRO: o volume está montado em /var/www/html; ele tem de ser montado em /var/www (na Railway: serviço > Settings > Volumes > Mount path = /var/www). Nada foi alterado"; exit 1 ;;
+    *) echo "[restaurar] ERRO: /var/www não é um volume: o site restaurado sumiria no próximo deploy. Crie um volume com Mount path = /var/www (para um teste local sem volume: RESTAURAR_SEM_VOLUME=sim). Nada foi alterado"; exit 1 ;;
+  esac
+fi
 
 VERSAO="$(printf '%s' "${RESTAURAR_VERSAO:-1}" | tr -d '\r\n')"
 [ -n "$VERSAO" ] || VERSAO=1
@@ -104,6 +122,26 @@ conferir_sha() { # arquivo esperado rótulo
 }
 
 marca() { head -n 1 "$CTRL/$1" 2>/dev/null || true; }
+marca_sha() { sed -n '3s/^sha256 //p' "$CTRL/$1" 2>/dev/null || true; }
+minusc() { printf '%s' "$1" | awk '{print tolower($1)}'; }
+SHA_ARQ_PEDIDO="$(minusc "${RESTAURAR_ARQUIVOS_SHA256:-}")"
+SHA_BANCO_PEDIDO="$(minusc "${RESTAURAR_BANCO_SHA256:-}")"
+motivo=""
+# pedido novo? (nome sha_pedido) -> 0 sim / 1 não; deixa o motivo em $motivo
+pedido_novo() {
+  local m ms
+  m="$(marca "$1")"; ms="$(marca_sha "$1")"
+  if [ "$m" != "$VERSAO" ]; then motivo="versão nova '$VERSAO' (atual: '${m:-nenhuma}')"; return 0; fi
+  if [ -n "$2" ] && [ "$2" != "$ms" ]; then
+    motivo="mesma versão '$VERSAO', mas o sha256 informado (${2:0:12}…) é diferente do restaurado (${ms:0:12}…)"; return 0
+  fi
+  return 1
+}
+aviso_sobrescrever_ignorado() { # rótulo
+  if [ "$SOBRESCREVER" = sim ]; then
+    log "AVISO: $1: RESTAURAR_SOBRESCREVER=sim ignorado: a versão '$VERSAO' (e o sha256, se informado) é a mesma já restaurada. Para sincronizar de novo, troque RESTAURAR_VERSAO (e os RESTAURAR_*_SHA256 do pacote novo)"
+  fi
+}
 gravar_marca() { # nome sha
   mkdir -p "$CTRL"; chmod 0700 "$CTRL"
   printf '%s\nrestaurado em %s\nsha256 %s\n' "$VERSAO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$CTRL/$1.tmp"
@@ -112,7 +150,7 @@ gravar_marca() { # nome sha
 
 # conteúdo = docroot com qualquer item, ou pasta/arquivo irmão visível (lost+found e ocultos não contam)
 tem_conteudo() {
-  [ -n "$(find "$DOCROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && return 0
+  [ -n "$(find "$DOCROOT" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ] && return 0
   [ -n "$(find "$BASE" -mindepth 1 -maxdepth 1 ! -name html ! -name lost+found ! -name '.*' -print -quit 2>/dev/null)" ]
 }
 
@@ -151,15 +189,15 @@ done
 # ---- decisão: arquivos
 fazer_arq=nao
 if [ -n "$URL_ARQ" ]; then
-  m="$(marca arquivos)"
   if ! tem_conteudo; then
     fazer_arq=sim; log "arquivos: volume sem conteúdo => restaurar"
-  elif [ "$m" = "$VERSAO" ]; then
+  elif ! pedido_novo arquivos "$SHA_ARQ_PEDIDO"; then
     log "arquivos: versão '$VERSAO' já restaurada; nada a fazer"
+    aviso_sobrescrever_ignorado arquivos
   elif [ "$SOBRESCREVER" = sim ]; then
-    fazer_arq=sim; log "arquivos: versão nova '$VERSAO' (atual: '${m:-nenhuma}') com RESTAURAR_SOBRESCREVER=sim => substituir"
+    fazer_arq=sim; log "arquivos: $motivo com RESTAURAR_SOBRESCREVER=sim => substituir"
   else
-    log "AVISO: arquivos: o volume já tem conteúdo (versão restaurada: '${m:-nenhuma}') e RESTAURAR_VERSAO='$VERSAO' é nova: NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
+    log "AVISO: arquivos: o volume já tem conteúdo e o pedido é novo: $motivo. NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
   fi
 fi
 
@@ -167,16 +205,15 @@ fi
 fazer_banco=nao
 if [ -n "$URL_BANCO" ]; then
   db_preparar
-  m="$(marca banco)"
   if [ -f "$CTRL/banco.em-andamento" ]; then
     log "banco: há importação anterior interrompida; esperando o banco em $db_host:$db_port (até ${ESPERA} s)"
     db_esperar "$ESPERA" || erro "banco: não respondeu em ${ESPERA} s; nada foi alterado"
     fazer_banco=sim; log "banco: refazer a importação interrompida"
-  elif [ "$m" = "$VERSAO" ]; then
+  elif ! pedido_novo banco "$SHA_BANCO_PEDIDO"; then
     # já restaurado: não segura o boot se o banco estiver fora (o site mostra o erro de conexão e volta sozinho)
     if db_esperar 30; then
       if [ "$(n_tabelas)" = 0 ]; then fazer_banco=sim; log "banco: versão '$VERSAO' marcada, mas o banco está sem tabelas => restaurar"
-      else log "banco: versão '$VERSAO' já restaurada; nada a fazer"; fi
+      else log "banco: versão '$VERSAO' já restaurada; nada a fazer"; aviso_sobrescrever_ignorado banco; fi
     else
       log "AVISO: banco: sem resposta em 30 s; versão '$VERSAO' já restaurada, seguindo sem conferir"
     fi
@@ -187,9 +224,9 @@ if [ -n "$URL_BANCO" ]; then
     if [ "$nt" = 0 ]; then
       fazer_banco=sim; log "banco: sem tabelas => restaurar"
     elif [ "$SOBRESCREVER" = sim ]; then
-      fazer_banco=sim; log "banco: $nt tabelas, versão nova '$VERSAO' (atual: '${m:-nenhuma}') com RESTAURAR_SOBRESCREVER=sim => substituir"
+      fazer_banco=sim; log "banco: $nt tabelas, $motivo com RESTAURAR_SOBRESCREVER=sim => substituir"
     else
-      log "AVISO: banco: já tem $nt tabelas (versão restaurada: '${m:-nenhuma}') e RESTAURAR_VERSAO='$VERSAO' é nova: NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
+      log "AVISO: banco: já tem $nt tabelas e o pedido é novo: $motivo. NÃO sobrescrito. Para substituir: RESTAURAR_SOBRESCREVER=sim"
     fi
   fi
 fi
@@ -238,18 +275,51 @@ if [ "$fazer_arq" = sim ]; then
     || erro "arquivos: o pós-cópia falhou (ver acima); nada foi alterado"
 fi
 
-# ---- 3. banco: importar (o dump já foi conferido); marcador "em andamento" cobre uma queda no meio
+# ---- 3. banco: importar (o dump já foi conferido); marcador "em andamento" cobre uma queda no meio.
+#      A importação apaga as tabelas antes; por isso, se o banco já tem tabelas, guarda uma cópia dele antes e,
+#      se a importação falhar, devolve a cópia (o banco que funcionava não se perde).
 if [ "$fazer_banco" = sim ]; then
   mkdir -p "$CTRL"; chmod 0700 "$CTRL"
+  COPIA="$CTRL/banco-anterior.sql.gz"
+  nt_antes="$(n_tabelas)" || erro "banco: não consegui contar as tabelas antes da importação; nada foi alterado"
+  if [ -f "$CTRL/banco.em-andamento" ]; then
+    # importação anterior interrompida: o banco atual pode estar pela metade (não vale como cópia); a cópia boa,
+    # se houver, é a que já existe (sem cópia = o banco estava vazio antes daquela importação)
+    if [ -s "$COPIA" ]; then log "banco: mantendo a cópia do banco anterior feita antes da importação interrompida"
+    else log "banco: a importação interrompida começou com o banco vazio; não há cópia a guardar"; fi
+  elif [ "$nt_antes" -gt 0 ]; then
+    log "banco: guardando cópia do banco atual ($nt_antes tabelas) antes de substituir"
+    rm -f "$COPIA.tmp"
+    ( umask 077; wpr-banco exportar "$COPIA.tmp" ) \
+      || { rm -f "$COPIA.tmp"; erro "banco: não consegui guardar a cópia do banco atual; nada foi alterado"; }
+    case "$(gzip -dc "$COPIA.tmp" | tail -n 1)" in
+      "-- Dump completed"*) ;;
+      *) rm -f "$COPIA.tmp"; erro "banco: a cópia do banco atual saiu incompleta; nada foi alterado" ;;
+    esac
+    mv -f "$COPIA.tmp" "$COPIA"
+    log "banco: cópia guardada ($(tamanho "$COPIA"))"
+  else
+    rm -f "$COPIA"
+  fi
   printf '%s\n' "$VERSAO" > "$CTRL/banco.em-andamento"
   log "banco: importando em $WORDPRESS_DB_NAME (as tabelas existentes são apagadas antes)"
-  wpr-banco importar "$TMP/banco.sql.gz" \
-    || erro "banco: a importação falhou; o próximo boot refaz a importação (o pacote é baixado de novo)"
-  nt="$(n_tabelas)" || erro "banco: não consegui contar as tabelas depois da importação"
-  [ "$nt" -gt 0 ] || erro "banco: a importação terminou sem nenhuma tabela"
+  falha_importacao() { # motivo
+    if [ -s "$COPIA" ]; then
+      log "banco: $1; devolvendo o banco anterior (cópia feita antes da importação)"
+      if wpr-banco importar "$COPIA" && [ "$(n_tabelas)" -gt 0 ]; then
+        rm -f "$CTRL/banco.em-andamento" "$COPIA"
+        erro "banco: $1 (versão '$VERSAO'); o banco anterior foi devolvido e nada foi marcado (confira o dump do pacote)"
+      fi
+      erro "banco: $1 e a devolução da cópia também falhou; a cópia continua em .wpr-restauracao/banco-anterior.sql.gz e o próximo boot tenta de novo"
+    fi
+    erro "banco: $1; o próximo boot refaz a importação (o pacote é baixado de novo)"
+  }
+  wpr-banco importar "$TMP/banco.sql.gz" || falha_importacao "a importação falhou"
+  nt="$(n_tabelas)" || falha_importacao "não consegui contar as tabelas depois da importação"
+  [ "$nt" -gt 0 ] || falha_importacao "a importação terminou sem nenhuma tabela"
   rm -f "$TMP/banco.sql.gz"
   gravar_marca banco "$sha_banco"
-  rm -f "$CTRL/banco.em-andamento"
+  rm -f "$CTRL/banco.em-andamento" "$COPIA"
   log "banco: restaurado ($nt tabelas); versão '$VERSAO' marcada"
 fi
 

@@ -1,13 +1,21 @@
 #!/bin/bash
 # Entrypoint do WordPress (imagem wordpress-railway). Prepara o contêiner e entrega para o Apache.
-# Não mexe no conteúdo do site, só: porta, atalho do caminho antigo (CAMINHO_ANTIGO), autorrestauração
+# Não mexe no conteúdo do site, só: portas, atalho do caminho antigo (CAMINHO_ANTIGO), autorrestauração
 # (só com RESTAURAR_*; ver wpr-restaurar), auto_prepend (ex.: Wordfence), filtro da pré-visualização,
 # mu-plugins da Railway e dono dos arquivos.
 set -euo pipefail
 DOCROOT=/var/www/html
 export APACHE_MAX_WORKERS="${APACHE_MAX_WORKERS:-25}"
-PORT="${PORT:-80}"
 log() { echo "[entrypoint] $*"; }
+
+# Portas: o Apache escuta SEMPRE na 80 e, se houver PORT diferente, também nela. A Railway injeta PORT=8080 em
+# todo serviço na hora de rodar (mesmo em imagem Docker); assim o domínio funciona com a porta de destino 80 ou
+# 8080, sem depender de alguém lembrar de definir PORT.
+PORT="${PORT:-80}"
+case "$PORT" in
+  ''|*[!0-9]*) log "AVISO: PORT='$PORT' não é um número; usando só a porta 80"; PORT=80 ;;
+esac
+PORTAS="80"; [ "$PORT" = 80 ] || PORTAS="80 $PORT"
 
 # caminho absoluto do docroot no servidor antigo (ex.: /home/<usuário>/domains/<site>/public_html)
 CAMINHO_ANTIGO="${CAMINHO_ANTIGO:-${HOSTINGER_DOCROOT:-}}"
@@ -21,10 +29,19 @@ case "$CAMINHO_ANTIGO" in
 esac
 export CAMINHO_ANTIGO
 
-if [ "$PORT" != "80" ]; then
-  sed -ri "s/^Listen 80\$/Listen ${PORT}/" /etc/apache2/ports.conf
-  sed -ri "s/<VirtualHost \*:80>/<VirtualHost *:${PORT}>/" /etc/apache2/sites-available/000-default.conf
-fi
+# (reescritos a cada boot: um reinício com outra PORT não acumula portas antigas)
+vhosts=""
+: > /etc/apache2/ports.conf
+for p in $PORTAS; do echo "Listen $p" >> /etc/apache2/ports.conf; vhosts="$vhosts *:$p"; done
+sed -ri "s/^<VirtualHost [^>]*>/<VirtualHost${vhosts}>/" /etc/apache2/sites-available/000-default.conf
+
+# Volume: sem volume em /var/www, tudo o que o site gravar some no próximo deploy (só avisa; quem trava é o
+# wpr-restaurar, quando há RESTAURAR_*)
+vrc=0; wpr-volume || vrc=$?
+case "$vrc" in
+  1) log "AVISO: /var/www não é um volume: arquivos gravados pelo site somem no próximo deploy (monte um volume em /var/www)" ;;
+  2) log "AVISO: o volume está montado em /var/www/html; o certo é montar em /var/www" ;;
+esac
 
 mkdir -p "$DOCROOT"
 chown www-data:www-data "$DOCROOT" /var/www
@@ -45,6 +62,13 @@ if ! wpr-restaurar; then
   log "ERRO: a restauração automática falhou (detalhes acima). O site NÃO foi iniciado e nada foi marcado como restaurado."
   log "Corrija as variáveis RESTAURAR_* (ou remova-as) e reimplante."
   exit 1
+fi
+# A restauração terminou: as RESTAURAR_* (URL e usuário:senha da pasta de download) saem do ambiente antes do
+# Apache, para o PHP (plugins, getenv, $_SERVER) não ter como lê-las.
+restaurar_vars="$(compgen -e | grep '^RESTAURAR_' || true)"
+if [ -n "$restaurar_vars" ]; then
+  for v in $restaurar_vars; do unset "$v"; done
+  log "variáveis RESTAURAR_* retiradas do ambiente do Apache/PHP"
 fi
 
 # auto_prepend_file (ex.: Wordfence "proteção estendida"): na hospedagem vinha do .htaccess (bloco LiteSpeed);
@@ -70,5 +94,5 @@ if [ -n "$(find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -pr
   find "$DOCROOT" -xdev \( ! -user www-data -o ! -group www-data \) -exec chown -h www-data:www-data {} +
 fi
 
-log "docroot: $(find "$DOCROOT" -mindepth 1 -maxdepth 1 | wc -l) itens no 1º nível; PHP $(php -r 'echo PHP_VERSION;'); porta $PORT"
+log "docroot: $(find "$DOCROOT" -mindepth 1 -maxdepth 1 | wc -l) itens no 1º nível; PHP $(php -r 'echo PHP_VERSION;'); portas ${PORTAS// / e }"
 exec "$@"

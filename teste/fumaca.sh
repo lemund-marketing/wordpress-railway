@@ -3,7 +3,9 @@
 #   WP_IMAGE=wordpress-railway:teste DB_IMAGE=mariadb-railway:teste bash teste/fumaca.sh
 # Cenário: MariaDB com BANCOS; um WordPress de verdade (wp-cli dentro da imagem) faz o papel do site antigo;
 # dump + tar no formato do pacote servidos por HTTP com Basic Auth; um segundo WordPress com volume vazio se
-# restaura sozinho pelas variáveis RESTAURAR_* e depois passa pelos casos de reinício, versão nova e sha256 errado.
+# restaura sozinho pelas variáveis RESTAURAR_* e depois passa pelos casos de reinício, versão nova, sha256 errado,
+# importação interrompida, banco fora do ar, sha256 novo com a mesma versão, importação que falha no meio (o banco
+# anterior volta) e volume ausente ou no lugar errado. Os sites restaurados rodam com PORT=8080, como na Railway.
 set -euo pipefail
 WP="${WP_IMAGE:?defina WP_IMAGE}"
 DB="${DB_IMAGE:?defina DB_IMAGE}"
@@ -14,14 +16,14 @@ HOST=site-um.exemplo.test
 OLD=/home/usuario-antigo/domains/site-um.exemplo.test/public_html
 TRAB="$(mktemp -d)"
 PACOTE="$TRAB/pacote"
-mkdir -p "$PACOTE/v1" "$PACOTE/v2"
+mkdir -p "$PACOTE/v1" "$PACOTE/v2" "$PACOTE/v3" "$PACOTE/v4"
 
 senha() { openssl rand -hex 16; }
 ROOTPW="$(senha)"; PW_ORIGEM="$(senha)"; PW_TESTE="$(senha)"; PW_EXTRA="$(senha)"; SRVPW="$(senha)"
 
 passo() { echo; echo "=== $*"; }
 ok() { echo "  OK: $*"; }
-falha() { echo "  FALHOU: $*"; exit 1; }
+falha() { echo "  FALHOU: $*" >&2; exit 1; }   # stderr: aparece mesmo dentro de $(...)
 
 fim() {
   local rc=$?
@@ -138,10 +140,24 @@ passo "Pacote v2 (título 'Site Teste Dois' + arquivo novo)"
 wpcli option update blogname "Site Teste Dois" >/dev/null
 docker exec -u www-data "$ID-origem" sh -c 'echo v2 > /var/www/html/versao2.txt'
 empacotar v2
+passo "Pacote v3 (título 'Site Teste Tres' + arquivo novo; usado com a MESMA versão 2 e sha256 novo)"
+wpcli option update blogname "Site Teste Tres" >/dev/null
+docker exec -u www-data "$ID-origem" sh -c 'echo v3 > /var/www/html/versao3.txt'
+empacotar v3
+passo "Pacote v4 (arquivos do v3; dump com título 'Site Teste Quatro' e um comando inválido no meio)"
+cp "$PACOTE/v3/site-arquivos.tar.gz" "$PACOTE/v4/"
+linhas="$(gzip -dc "$PACOTE/v3/site-banco.sql.gz" | wc -l)"
+gzip -dc "$PACOTE/v3/site-banco.sql.gz" | sed 's/Site Teste Tres/Site Teste Quatro/g' \
+  | awk -v meio="$(( linhas / 2 ))" 'NR >= meio && !feito && /^DROP TABLE IF EXISTS/ { print "INSERT INTO wpr_tabela_que_nao_existe VALUES (1);"; feito = 1 } { print }' \
+  | gzip -6 > "$PACOTE/v4/site-banco.sql.gz"
+[ "$(gzip -dc "$PACOTE/v4/site-banco.sql.gz" | grep -c wpr_tabela_que_nao_existe)" = 1 ] || falha "dump v4 sem o comando inválido"
+case "$(gzip -dc "$PACOTE/v4/site-banco.sql.gz" | tail -n 1)" in "-- Dump completed"*) ;; *) falha "dump v4 sem '-- Dump completed'" ;; esac
 echo "texto neutro para testar alcance" > "$PACOTE/teste.txt"
 chmod -R a+rX "$TRAB"
 SHA2_ARQ="$(grep site-arquivos "$PACOTE/v2/SHA256SUMS" | cut -d' ' -f1)"
 SHA2_BANCO="$(grep site-banco "$PACOTE/v2/SHA256SUMS" | cut -d' ' -f1)"
+SHA3_ARQ="$(grep site-arquivos "$PACOTE/v3/SHA256SUMS" | cut -d' ' -f1)"
+SHA3_BANCO="$(grep site-banco "$PACOTE/v3/SHA256SUMS" | cut -d' ' -f1)"
 
 passo "Servidor HTTP local com Basic Auth"
 docker run -d --name "$ID-arquivos" --network "$NET" --network-alias arquivos -e AUTH_USER=pacote -e AUTH_PASS="$SRVPW" \
@@ -159,17 +175,32 @@ baixados() { docker logs "$ID-arquivos" 2>&1 | grep -c "\"GET /$1/site-arquivos.
 
 # ------------------------------------------------------------------------------- site restaurado
 docker volume create "$ID-destino" >/dev/null
-destino() { # VERSAO URL_BASE [opções extras do docker run...]
-  local v="$1" u="$2"; shift 2
-  docker rm -f "$ID-destino" >/dev/null 2>&1 || true
-  docker run -d --name "$ID-destino" --network "$NET" -v "$ID-destino":/var/www \
+restaurador() { # NOME VERSAO URL_BASE [opções extras do docker run...]  (PORT=8080: a Railway injeta essa porta)
+  local n="$1" v="$2" u="$3"; shift 3
+  docker rm -f "$ID-$n" >/dev/null 2>&1 || true
+  docker run -d --name "$ID-$n" --network "$NET" -e PORT=8080 \
     -e WORDPRESS_DB_HOST=db:3306 -e WORDPRESS_DB_NAME=teste -e WORDPRESS_DB_USER=teste -e WORDPRESS_DB_PASSWORD="$PW_TESTE" \
     -e CAMINHO_ANTIGO="$OLD" -e SITE_DOMAIN="$HOST" -e PHP_AUTO_PREPEND_FILE=/var/www/html/wordfence-waf.php \
     -e RESTAURAR_AUTH="pacote:$SRVPW" -e RESTAURAR_ARQUIVOS_URL="$u/site-arquivos.tar.gz" \
     -e RESTAURAR_BANCO_URL="$u/site-banco.sql.gz" -e RESTAURAR_VERSAO="$v" "$@" "$WP" >/dev/null
 }
+destino() { # VERSAO URL_BASE [opções extras do docker run...]
+  local v="$1" u="$2"; shift 2
+  restaurador destino "$v" "$u" -v "$ID-destino":/var/www "$@"
+}
+esperar_saida() { # NOME -> imprime o código de saída (falha se não parar em 4 min)
+  local i
+  for i in $(seq 1 120); do
+    [ "$(docker inspect -f '{{.State.Status}}' "$ID-$1")" = exited ] && break
+    sleep 2
+  done
+  [ "$(docker inspect -f '{{.State.Status}}' "$ID-$1")" = exited ] || falha "o contêiner $1 deveria ter parado com erro"
+  docker inspect -f '{{.State.ExitCode}}' "$ID-$1"
+}
+# volume do destino visto de fora, logo depois de uma falha (antes de qualquer boot novo, que limparia sobras)
+volume_destino() { docker run --rm -v "$ID-destino":/v --entrypoint sh "$WP" -c "$1"; }
 dx() { docker exec "$ID-destino" "$@"; }
-codigo() { docker exec "$ID-destino" curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" -H 'X-Forwarded-Proto: https' http://127.0.0.1/ 2>/dev/null || true; }
+codigo() { docker exec "$ID-destino" curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST" -H 'X-Forwarded-Proto: https' "http://127.0.0.1:${1:-80}/" 2>/dev/null || true; }
 esperar_site() {
   local i st
   for i in $(seq 1 150); do
@@ -212,6 +243,26 @@ h="$(pagina teste-123.up.railway.app)"; grep -qi '^x-railway-preview: 1' <<<"$h"
 l="$(logs)"
 if grep -qF -e "$SRVPW" -e "$PW_TESTE" -e "$PW_ORIGEM" -e "/v1/" <<<"$l"; then falha "o log mostrou senha ou URL completa"; fi
 ok "wp-config pelo ambiente, symlink relativo, .htaccess, pasta irmã, atalho antigo, dono, mu-plugins, auto_prepend, preview, marcadores, log sem segredo"
+# portas: com PORT=8080 (Railway) o Apache atende na 80 E na 8080
+[ "$(codigo 8080)" = 200 ] || falha "com PORT=8080 a porta 8080 não respondeu 200"
+[ "$(codigo 80)" = 200 ] || falha "com PORT=8080 a porta 80 deixou de responder"
+grep -q 'portas 80 e 8080' <<<"$l" || falha "log sem 'portas 80 e 8080'"
+ok "PORT=8080: o Apache atende na 80 e na 8080"
+# o PHP não enxerga as RESTAURAR_* (URL e senha da pasta de download), mas enxerga o resto do ambiente
+docker exec -i "$ID-destino" sh -c 'cat > /var/www/html/wpr-env-teste.php' <<'PHP'
+<?php
+$vazou = array();
+foreach (array('RESTAURAR_AUTH', 'RESTAURAR_ARQUIVOS_URL', 'RESTAURAR_BANCO_URL', 'RESTAURAR_VERSAO') as $v) {
+  if (getenv($v) !== false || isset($_SERVER[$v]) || isset($_ENV[$v])) { $vazou[] = $v; }
+}
+if (getenv('WORDPRESS_DB_NAME') === false) { echo 'sem-ambiente'; } else { echo $vazou ? 'vazou: ' . implode(' ', $vazou) : 'limpo'; }
+PHP
+r="$(docker exec "$ID-destino" curl -s -H "Host: $HOST" -H 'X-Forwarded-Proto: https' http://127.0.0.1/wpr-env-teste.php || true)"
+dx rm -f /var/www/html/wpr-env-teste.php
+[ "$r" = limpo ] || falha "o PHP deveria ver WORDPRESS_DB_NAME e não ver RESTAURAR_* (veio: '$r')"
+[ "$(dx sh -c "tr '\\0' '\\n' < /proc/1/environ | grep -c '^RESTAURAR_'" || true)" = 0 ] || falha "RESTAURAR_* no ambiente do Apache (PID 1)"
+grep -q 'variáveis RESTAURAR_\* retiradas' <<<"$l" || falha "log sem 'variáveis RESTAURAR_* retiradas'"
+ok "o PHP e o Apache não veem as RESTAURAR_*"
 mostrar_log
 
 passo "2. Reiniciar não restaura de novo"
@@ -248,15 +299,11 @@ ok "conteúdo da versão 2 no ar"
 
 passo "5. sha256 errado: falha sem estragar o site"
 destino 3 "http://arquivos:8000/v1" -e RESTAURAR_SOBRESCREVER=sim -e RESTAURAR_ARQUIVOS_SHA256="$(printf '0%.0s' $(seq 64))"
-for i in $(seq 1 120); do
-  [ "$(docker inspect -f '{{.State.Status}}' "$ID-destino")" = exited ] && break
-  sleep 2
-done
-[ "$(docker inspect -f '{{.State.Status}}' "$ID-destino")" = exited ] || falha "o contêiner deveria ter parado com erro"
-rc="$(docker inspect -f '{{.State.ExitCode}}' "$ID-destino")"
+rc="$(esperar_saida destino)"
 [ "$rc" != 0 ] || falha "o contêiner saiu com código 0"
 grep -q "sha256 diferente do informado" <<<"$(logs)" || falha "log sem o motivo (sha256)"
 mostrar_log
+if [ -n "$(volume_destino 'ls -d /v/.wpr-tmp-* 2>/dev/null' || true)" ]; then falha "a tentativa com sha256 errado deixou temporários no volume"; fi
 [ "$(blogname)" = "Site Teste Dois" ] || falha "o banco foi alterado apesar do sha256 errado"
 destino 2 "http://arquivos:8000/v2"
 esperar_site
@@ -294,6 +341,71 @@ docker start "$ID-db" >/dev/null
 esperar_login teste "$PW_TESTE" 120 || falha "o banco não voltou"
 esperar_site
 ok "Apache no ar com o banco fora (home $c) e de volta a 200 quando o banco voltou"
+
+passo "8. Mesma RESTAURAR_VERSAO (2) com sha256 novo (pacote v3): sem SOBRESCREVER avisa; com SOBRESCREVER substitui"
+destino 2 "http://arquivos:8000/v3" -e RESTAURAR_ARQUIVOS_SHA256="$SHA3_ARQ" -e RESTAURAR_BANCO_SHA256="$SHA3_BANCO"
+esperar_site
+t="$(titulo)"; [ "$t" = "Site Teste Dois" ] || falha "sem SOBRESCREVER o título mudou para '$t'"
+[ "$(baixados v3)" = 0 ] || falha "baixou o v3 sem RESTAURAR_SOBRESCREVER"
+[ "$(grep -c 'NÃO sobrescrito' <<<"$(logs)")" = 2 ] || falha "log sem os 2 avisos de 'NÃO sobrescrito'"
+[ "$(grep -c 'sha256 informado' <<<"$(logs)")" = 2 ] || falha "log sem o motivo (sha256 informado diferente do restaurado)"
+ok "sem SOBRESCREVER: o pedido novo é avisado e nada muda"
+destino 2 "http://arquivos:8000/v3" -e RESTAURAR_SOBRESCREVER=sim \
+  -e RESTAURAR_ARQUIVOS_SHA256="$SHA3_ARQ" -e RESTAURAR_BANCO_SHA256="$SHA3_BANCO"
+esperar_site
+t="$(titulo)"; [ "$t" = "Site Teste Tres" ] || falha "título '$t' (esperado 'Site Teste Tres')"
+[ "$(blogname)" = "Site Teste Tres" ] || falha "o banco não foi substituído pelo v3"
+[ "$(dx cat /var/www/html/versao3.txt)" = v3 ] || falha "arquivo novo do v3 ausente"
+[ "$(marca arquivos)" = 2 ] && [ "$(marca banco)" = 2 ] || falha "marcadores deveriam continuar '2'"
+[ "$(dx sed -n '3s/^sha256 //p' /var/www/.wpr-restauracao/arquivos)" = "$SHA3_ARQ" ] || falha "marcador de arquivos sem o sha256 do v3"
+[ "$(dx sed -n '3s/^sha256 //p' /var/www/.wpr-restauracao/banco)" = "$SHA3_BANCO" ] || falha "marcador do banco sem o sha256 do v3"
+grep -q 'guardando cópia do banco atual' <<<"$(logs)" || falha "log sem a cópia do banco antes de substituir"
+if dx test -e /var/www/.wpr-restauracao/banco-anterior.sql.gz; then falha "a cópia do banco anterior ficou depois do sucesso"; fi
+ok "com SOBRESCREVER=sim: v3 no ar com a mesma versão '2'"
+antes="$(baixados v3)"
+destino 2 "http://arquivos:8000/v3" -e RESTAURAR_SOBRESCREVER=sim \
+  -e RESTAURAR_ARQUIVOS_SHA256="$SHA3_ARQ" -e RESTAURAR_BANCO_SHA256="$SHA3_BANCO"
+esperar_site
+[ "$(baixados v3)" = "$antes" ] || falha "baixou de novo um pacote já restaurado"
+[ "$(grep -c 'RESTAURAR_SOBRESCREVER=sim ignorado' <<<"$(logs)")" = 2 ] || falha "log sem os 2 avisos de SOBRESCREVER ignorado"
+ok "mesmo pedido com SOBRESCREVER=sim: nada baixado e aviso de 'ignorado'"
+
+passo "9. Importação que falha no meio (dump v4 inválido) com SOBRESCREVER=sim: o banco anterior volta"
+dx touch /var/www/html/sentinela9.txt
+n_tab() { db_sql teste "$PW_TESTE" "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='teste'"; }
+nt_antes="$(n_tab)"
+destino 4 "http://arquivos:8000/v4" -e RESTAURAR_SOBRESCREVER=sim
+rc="$(esperar_saida destino)"
+[ "$rc" != 0 ] || falha "o contêiner saiu com código 0"
+mostrar_log
+grep -q 'devolvendo o banco anterior' <<<"$(logs)" || falha "log sem 'devolvendo o banco anterior'"
+grep -q 'o banco anterior foi devolvido' <<<"$(logs)" || falha "log sem 'o banco anterior foi devolvido'"
+[ "$(blogname)" = "Site Teste Tres" ] || falha "o banco não voltou ao v3 (blogname '$(blogname)')"
+[ "$(n_tab)" = "$nt_antes" ] || falha "número de tabelas mudou ($nt_antes -> $(n_tab))"
+v="$(volume_destino 'ls -A /v /v/.wpr-restauracao' || true)"
+if grep -qE 'wpr-tmp-|banco-anterior|em-andamento' <<<"$v"; then falha "sobras no volume depois da falha: $(tr '\n' ' ' <<<"$v")"; fi
+destino 2 "http://arquivos:8000/v3"
+esperar_site
+t="$(titulo)"; [ "$t" = "Site Teste Tres" ] || falha "o site mudou depois da falha (título '$t')"
+dx test -f /var/www/html/sentinela9.txt || falha "os arquivos foram trocados apesar da falha no banco"
+[ "$(marca arquivos)" = 2 ] && [ "$(marca banco)" = 2 ] || falha "marcadores mudaram depois da falha"
+ok "saiu com código $rc; banco v3 devolvido ($nt_antes tabelas), arquivos e marcadores intactos, sem sobras"
+
+passo "10. Sem volume, ou volume montado em /var/www/html: recusa restaurar"
+antes="$(baixados v1)"
+restaurador semvol 1 "http://arquivos:8000/v1"
+rc="$(esperar_saida semvol)"
+[ "$rc" != 0 ] || falha "sem volume o contêiner saiu com código 0"
+docker logs "$ID-semvol" 2>&1 | grep -q '/var/www não é um volume' || falha "sem volume: log sem o motivo"
+docker volume create "$ID-volhtml" >/dev/null
+restaurador volhtml 1 "http://arquivos:8000/v1" -v "$ID-volhtml":/var/www/html
+rc2="$(esperar_saida volhtml)"
+[ "$rc2" != 0 ] || falha "com volume em /var/www/html o contêiner saiu com código 0"
+docker logs "$ID-volhtml" 2>&1 | grep -q 'montado em /var/www/html' || falha "volume em /var/www/html: log sem o motivo"
+[ "$(baixados v1)" = "$antes" ] || falha "baixou o pacote mesmo sem volume"
+docker logs "$ID-semvol" 2>&1 | grep -E '^\[(restaurar|entrypoint)\]' | sed 's/^/    /' || true
+docker logs "$ID-volhtml" 2>&1 | grep -E '^\[(restaurar|entrypoint)\]' | sed 's/^/    /' || true
+ok "recusou nos dois casos (códigos $rc e $rc2), sem baixar nada"
 
 echo
 echo "TESTE DE FUMAÇA: TUDO OK ($WP + $DB)"
