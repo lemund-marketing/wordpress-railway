@@ -407,5 +407,20 @@ docker logs "$ID-semvol" 2>&1 | grep -E '^\[(restaurar|entrypoint)\]' | sed 's/^
 docker logs "$ID-volhtml" 2>&1 | grep -E '^\[(restaurar|entrypoint)\]' | sed 's/^/    /' || true
 ok "recusou nos dois casos (códigos $rc e $rc2), sem baixar nada"
 
+# Defeito do runtime da Railway (03/11/2026): o mpm_event reaparece em mods-enabled e o Apache cai com AH00534.
+docker run -d --name "$ID-mpm" --entrypoint bash "$WP" -c \
+  'cd /etc/apache2/mods-enabled && ln -sf ../mods-available/mpm_event.load mpm_event.load \
+     && ln -sf ../mods-available/mpm_event.conf mpm_event.conf && exec wpr-entrypoint apache2-foreground' >/dev/null
+c=000
+for i in $(seq 1 60); do
+  c="$(docker exec "$ID-mpm" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/ 2>/dev/null || true)"
+  [ -n "$c" ] && [ "$c" != 000 ] && break
+  sleep 1
+done
+[ -n "$c" ] && [ "$c" != 000 ] || { docker logs "$ID-mpm" 2>&1 | tail -20; falha "com mpm_event a mais o Apache não subiu"; }
+docker logs "$ID-mpm" 2>&1 | grep -q 'MPM a mais removido' || falha "mpm_event a mais: log sem o aviso"
+docker rm -f "$ID-mpm" >/dev/null
+ok "mpm_event reaparecendo (Railway): removido no boot e Apache no ar (HTTP $c)"
+
 echo
 echo "TESTE DE FUMAÇA: TUDO OK ($WP + $DB)"

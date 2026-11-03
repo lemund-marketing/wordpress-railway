@@ -7,6 +7,18 @@ set -euo pipefail
 DOCROOT=/var/www/html
 export APACHE_MAX_WORKERS="${APACHE_MAX_WORKERS:-25}"
 log() { echo "[entrypoint] $*"; }
+cd /   # a restauração apaga pastas temporárias; sem isto o shell reclama de "getcwd" no log
+
+# Um MPM só (mod_php exige o prefork). No runtime da Railway (relatos desde dez/2025, visto aqui em 03/11/2026) o
+# mpm_event que a imagem base desliga volta a aparecer em mods-enabled: o "apache2ctl -t" do build passa e o
+# Apache cai com AH00534 "More than one MPM loaded". Corrigido a cada boot, antes de qualquer outra coisa.
+mods=/etc/apache2/mods-enabled
+extras="$(cd "$mods" && ls mpm_event.* mpm_worker.* 2>/dev/null || true)"
+if [ -n "$extras" ]; then
+  (cd "$mods" && rm -f $extras)
+  log "Apache: MPM a mais removido de mods-enabled ($(echo $extras)); fica só o prefork"
+fi
+[ -e "$mods/mpm_prefork.load" ] || { a2enmod -q mpm_prefork >/dev/null; log "Apache: mpm_prefork religado"; }
 
 # Portas: o Apache escuta SEMPRE na 80 e, se houver PORT diferente, também nela. A Railway injeta PORT=8080 em
 # todo serviço na hora de rodar (mesmo em imagem Docker); assim o domínio funciona com a porta de destino 80 ou
